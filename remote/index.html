@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="LidWake">
+<title>LidWake Remote</title>
+<style>
+  :root {
+    --bg: #f2f2f7; --card: #ffffff; --text: #1c1c1e; --muted: #6c6c70; --line: #e3e3e8;
+    --accent: #007aff; --accent-text: #ffffff; --ok: #248a3d; --ok-bg: #e3f5e8;
+    --warn: #b25000; --danger: #d70015; --danger-bg: #fdecee; --chip: #eeeef3;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #000000; --card: #1c1c1e; --text: #f2f2f7; --muted: #98989f; --line: #2c2c2e;
+      --accent: #0a84ff; --ok: #30d158; --ok-bg: #0f2e18; --warn: #ff9f0a;
+      --danger: #ff453a; --danger-bg: #3a1513; --chip: #2c2c2e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+  main { max-width: 520px; margin: 0 auto; padding: max(16px, env(safe-area-inset-top)) 16px 40px; }
+  header { display: flex; align-items: center; justify-content: space-between; margin: 8px 0 16px; }
+  h1 { font-size: 28px; margin: 0; letter-spacing: -0.02em; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 600; margin: 0 0 10px; }
+  .pill { font-size: 13px; font-weight: 600; padding: 4px 10px; border-radius: 999px; background: var(--chip); color: var(--muted); }
+  .pill.on { background: var(--ok-bg); color: var(--ok); }
+  .card { background: var(--card); border-radius: 14px; padding: 16px; margin-bottom: 14px; }
+  .big { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+  .muted { color: var(--muted); font-size: 14px; }
+  .meta { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 10px; font-size: 14px; color: var(--muted); }
+  .meta b { color: var(--text); font-weight: 600; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li.event { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-top: 1px solid var(--line); }
+  li.event:first-child { border-top: 0; padding-top: 0; }
+  li.event .txt { flex: 1; min-width: 0; }
+  li.event .txt div:first-child { overflow-wrap: anywhere; }
+  .empty { color: var(--muted); font-size: 14px; padding: 4px 0 8px; }
+  button, select, input {
+    font: inherit; color: inherit; border-radius: 10px; border: 1px solid var(--line);
+    background: var(--card); padding: 10px 12px; min-height: 44px;
+  }
+  button { cursor: pointer; font-weight: 600; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.small { min-height: 34px; padding: 4px 10px; font-size: 14px; }
+  button.icon { min-width: 34px; min-height: 34px; padding: 0; font-size: 18px; line-height: 1; color: var(--muted); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  button.danger { color: var(--danger); }
+  .add { display: grid; grid-template-columns: 1fr; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+  .add .row { display: flex; gap: 8px; }
+  .add .row > * { flex: 1; min-width: 0; }
+  .add .row > button { flex: 0 0 auto; }
+  .seg { display: flex; background: var(--chip); border-radius: 10px; padding: 3px; }
+  .seg button { flex: 1; border: 0; background: transparent; min-height: 36px; font-weight: 500; color: var(--muted); }
+  .seg button.sel { background: var(--card); color: var(--text); font-weight: 600; box-shadow: 0 1px 3px rgba(0,0,0,.12); }
+  .actions { display: grid; gap: 10px; }
+  .actions button { width: 100%; }
+  .banner { border-radius: 10px; padding: 10px 12px; margin-bottom: 14px; font-size: 14px; }
+  .banner.err { background: var(--danger-bg); color: var(--danger); }
+  .hint { font-size: 13px; color: var(--muted); margin: 8px 0 0; }
+  button:not(:disabled):hover { filter: brightness(.96); }
+  button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  code { font-size: 13px; background: var(--chip); padding: 1px 5px; border-radius: 5px; }
+  [hidden] { display: none !important; }
+
+  /* Desktop / tablet: events on the right, controls on the left. */
+  @media (min-width: 860px) {
+    main { max-width: 980px; padding-top: 32px; }
+    #auth { max-width: 520px; }
+    #app {
+      display: grid; column-gap: 18px; align-items: start;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr);
+      grid-template-areas: "status events" "then events" "actions events" "last events";
+      grid-template-rows: auto auto auto 1fr;
+    }
+    .a-status { grid-area: status; } .a-events { grid-area: events; } .a-then { grid-area: then; }
+    .a-actions { grid-area: actions; } .a-last { grid-area: last; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>LidWake</h1>
+    <span id="pill" class="pill">…</span>
+  </header>
+
+  <div id="banner" class="banner err" hidden></div>
+
+  <section id="auth" class="card" hidden>
+    <p class="big">Enter access token</p>
+    <p class="muted">Run <code>lidwake remote</code> on the Mac and open the link it prints, or paste the token (the part after <code>#t=</code>) here.</p>
+    <form id="tokenForm" class="add" style="border:0;padding:0">
+      <div class="row">
+        <input id="tokenInput" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="token">
+        <button class="primary">Save</button>
+      </div>
+    </form>
+  </section>
+
+  <div id="app" hidden>
+    <section class="card a-status">
+      <p id="headline" class="big"></p>
+      <p id="subline" class="muted"></p>
+      <div class="meta">
+        <span>Battery <b id="battery">–</b></span>
+        <span id="elapsedWrap">Running <b id="elapsed">–</b></span>
+      </div>
+    </section>
+
+    <section class="card a-events">
+      <h2 id="eventsTitle">Ends when</h2>
+      <ul id="events"></ul>
+      <form id="addForm" class="add">
+        <div class="row">
+          <select id="addType" aria-label="Event type"></select>
+        </div>
+        <div class="row">
+          <input id="addValue" aria-label="Value">
+          <button id="addBtn" type="submit">Add</button>
+        </div>
+      </form>
+      <p id="defaultsHint" class="hint">Battery ≤ 10% and a 12h safety limit are added automatically. You can remove them once it’s running.</p>
+    </section>
+
+    <section class="card a-then">
+      <h2>When it ends</h2>
+      <div id="then" class="seg" role="radiogroup">
+        <button data-v="sleep" role="radio">Sleep</button>
+        <button data-v="shutdown" role="radio">Shut down</button>
+        <button data-v="none" role="radio">Nothing</button>
+      </div>
+    </section>
+
+    <div class="actions a-actions">
+      <button id="startBtn" class="primary">Start keeping awake</button>
+      <button id="endBtn" class="primary">End now</button>
+      <button id="stopBtn" class="danger">Stop &amp; allow sleep</button>
+    </div>
+    <p id="last" class="hint a-last" style="text-align:center;margin-top:16px"></p>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+};
+
+let token = store.get('lidwake-token') || '';
+const fromHash = location.hash.match(/t=([0-9a-f]+)/);
+if (fromHash) {
+  token = fromHash[1];
+  store.set('lidwake-token', token);
+  history.replaceState(null, '', location.pathname);
+}
+
+let state = null;          // last /api/status
+let clockOffset = 0;       // server clock minus ours, seconds
+let pending = [];          // events chosen before starting: {args, label}
+let pendingThen = 'sleep';
+let busy = false;
+let listKey = '';         // what the event list was last built from
+
+const TYPES = {
+  claude:  { label: 'Claude finishes a reply' },
+  for:     { label: 'Timer', input: { placeholder: 'e.g. 45m, 2h, 1h30m', value: '1h' } },
+  at:      { label: 'Clock time', input: { type: 'time' } },
+  process: { label: 'Process exits', input: { placeholder: 'process name, e.g. ffmpeg', autocapitalize: 'off' } },
+  pid:     { label: 'PID exits', input: { type: 'number', placeholder: 'PID', inputmode: 'numeric' } },
+  file:    { label: 'File appears', input: { placeholder: '/path/to/file', autocapitalize: 'off' } },
+  unplug:  { label: 'Charger is unplugged' },
+  battery: { label: 'Battery drops to…', input: { type: 'number', placeholder: '%', value: '20', inputmode: 'numeric' } },
+  max:     { label: 'Safety limit', input: { placeholder: 'e.g. 12h', value: '12h' } },
+  signal:  { label: 'Custom signal', input: { placeholder: 'name for: lidwake signal NAME', autocapitalize: 'off' } },
+};
+
+function argsFor(type, value) {
+  switch (type) {
+    case 'claude': return ['--claude'];
+    case 'unplug': return ['--unplug'];
+    default: return ['--' + type, value];
+  }
+}
+
+async function api(path, body) {
+  const res = await fetch('/api/' + path, {
+    method: body === undefined ? 'GET' : 'POST',
+    headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (res.status === 401) { showAuth(); throw new Error('Wrong or missing access token'); }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || 'Request failed (' + res.status + ')');
+  return data;
+}
+
+async function act(path, body) {
+  if (busy) return;
+  busy = true;
+  render();
+  try {
+    apply(await api(path, body));
+    hideBanner();
+    return true;
+  } catch (e) {
+    if (e.message !== 'Wrong or missing access token') showBanner(e.message);
+    return false;
+  } finally {
+    busy = false;
+    render();
+  }
+}
+
+async function refresh() {
+  if (!token) return showAuth();
+  try {
+    apply(await api('status'));
+    if ($('banner').dataset.kind === 'offline') hideBanner();
+  } catch (e) {
+    if (e instanceof TypeError) showBanner('Can’t reach the Mac — it may be asleep, offline, or its tunnel address changed (run lidwake remote on the Mac).', 'offline');
+  }
+}
+
+function apply(s) {
+  state = s;
+  clockOffset = s.now - Date.now() / 1000;
+  $('auth').hidden = true;
+  $('app').hidden = false;
+  render();
+}
+
+function showAuth() {
+  $('auth').hidden = false;
+  $('app').hidden = true;
+  $('pill').textContent = 'Locked';
+}
+function showBanner(msg, kind = 'error') { const b = $('banner'); b.textContent = msg; b.dataset.kind = kind; b.hidden = false; }
+function hideBanner() { $('banner').hidden = true; $('banner').dataset.kind = ''; }
+
+const now = () => Date.now() / 1000 + clockOffset;
+const hhmm = (t) => new Date(t * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+function dur(sec) {
+  sec = Math.max(0, Math.round(sec));
+  const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60);
+  return h ? `${h}h ${String(m).padStart(2, '0')}m` : m ? `${m}m` : `${sec % 60}s`;
+}
+
+function el(tag, props = {}, ...kids) {
+  const n = Object.assign(document.createElement(tag), props);
+  for (const k of kids) if (k != null) n.append(k);
+  return n;
+}
+
+function eventRow(label, until, buttons) {
+  const detail = until ? el('div', { className: 'muted countdown' }) : null;
+  if (detail) detail.dataset.until = until;
+  return el('li', { className: 'event' },
+    el('div', { className: 'txt' }, el('div', { textContent: label }), detail),
+    ...buttons);
+}
+
+// Cheap per-second update: clocks only, so buttons aren't rebuilt under a finger.
+function tick() {
+  if (state && state.active) $('elapsed').textContent = dur(now() - state.started);
+  for (const n of document.querySelectorAll('.countdown')) {
+    const t = +n.dataset.until;
+    n.textContent = `at ${hhmm(t)} · ${dur(t - now())} left`;
+  }
+}
+
+function render() {
+  if (!state) return;
+  const active = state.active;
+  $('pill').textContent = active ? 'Awake' : 'Idle';
+  $('pill').className = 'pill' + (active ? ' on' : '');
+  $('headline').textContent = active ? 'Staying awake — lid can be closed' : 'Not running';
+  $('subline').textContent = active
+    ? `${state.host || 'Mac'} · since ${hhmm(state.started)}`
+    : `${state.host || 'Mac'} sleeps normally when its lid closes.`;
+  $('battery').textContent = state.battery == null ? 'n/a' : `${state.battery}%${state.ac ? ' · charging' : ''}`;
+  $('elapsedWrap').hidden = !active;
+
+  $('eventsTitle').textContent = active ? 'Ends at the first of' : 'Will end at the first of';
+  $('defaultsHint').hidden = active;
+  const list = $('events');
+  const key = JSON.stringify([active, busy, active ? state.conditions : pending.map((p) => p.label)]);
+  if (key !== listKey) {
+  listKey = key;
+  list.replaceChildren();
+  if (active) {
+    for (const c of state.conditions) {
+      const timer = c.type === 'deadline' || c.type === 'limit';
+      const buttons = [];
+      if (timer) buttons.push(el('button', { className: 'small', textContent: '+30m', disabled: busy,
+        onclick: () => act('extend', { id: c.id, by: '30m' }) }));
+      buttons.push(el('button', { className: 'icon', textContent: '×', title: 'Remove', disabled: busy,
+        ariaLabel: 'Remove ' + c.label, onclick: () => act('remove', { id: c.id }) }));
+      list.append(eventRow(c.label, timer ? c.arg : null, buttons));
+    }
+    if (!state.conditions.length) list.append(el('li', { className: 'empty', textContent: 'No events — runs until you stop it.' }));
+  } else {
+    pending.forEach((p, i) => list.append(eventRow(p.label, null, [
+      el('button', { className: 'icon', textContent: '×', ariaLabel: 'Remove ' + p.label,
+        onclick: () => { pending.splice(i, 1); render(); } }),
+    ])));
+    if (!pending.length) list.append(el('li', { className: 'empty', textContent: 'Add events below.' }));
+  }
+  }
+  tick();
+
+  const thenValue = active ? state.then : pendingThen;
+  for (const b of $('then').children) {
+    const sel = b.dataset.v === thenValue;
+    b.className = sel ? 'sel' : '';
+    b.setAttribute('aria-checked', sel);
+    b.disabled = busy;
+  }
+
+  const thenWord = { sleep: '& sleep', shutdown: '& shut down', none: '' }[thenValue];
+  $('startBtn').hidden = active;
+  $('endBtn').hidden = !active;
+  $('stopBtn').hidden = !active;
+  $('endBtn').textContent = `End now ${thenWord}`.trim();
+  $('endBtn').hidden = !active || thenValue === 'none';
+  for (const id of ['startBtn', 'endBtn', 'stopBtn', 'addBtn']) $(id).disabled = busy;
+
+  $('last').textContent = !active && state.last
+    ? `Last session ended ${new Date(state.last.at * 1000).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' })}: ${state.last.reason}`
+    : '';
+}
+
+// --- add-event form ---
+for (const [k, t] of Object.entries(TYPES)) $('addType').append(el('option', { value: k, textContent: t.label }));
+function syncInput() {
+  const t = TYPES[$('addType').value];
+  const input = $('addValue');
+  input.hidden = !t.input;
+  input.type = (t.input && t.input.type) || 'text';
+  input.placeholder = (t.input && t.input.placeholder) || '';
+  input.value = (t.input && t.input.value) || '';
+  input.setAttribute('autocapitalize', (t.input && t.input.autocapitalize) || 'on');
+  input.setAttribute('inputmode', (t.input && t.input.inputmode) || 'text');
+}
+$('addType').addEventListener('change', syncInput);
+syncInput();
+
+$('addForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const type = $('addType').value;
+  const t = TYPES[type];
+  const value = $('addValue').value.trim();
+  if (t.input && !value) return $('addValue').focus();
+  const args = argsFor(type, value);
+  if (state && state.active) {
+    if (await act('add', { args })) syncInput();
+  } else {
+    pending.push({ args, label: t.input ? `${t.label.replace('…', '')} ${value}` : t.label });
+    syncInput();
+    render();
+  }
+});
+
+$('then').addEventListener('click', (e) => {
+  const v = e.target.dataset && e.target.dataset.v;
+  if (!v) return;
+  if (state && state.active) act('then', { action: v });
+  else { pendingThen = v; render(); }
+});
+
+$('startBtn').addEventListener('click', async () => {
+  const args = pending.flatMap((p) => p.args).concat(['--then', pendingThen]);
+  if (await act('start', { args })) pending = [];
+  render();
+});
+$('stopBtn').addEventListener('click', () => {
+  if (confirm('Stop LidWake? The Mac will sleep normally again (immediately, if the lid is closed).')) act('stop', {});
+});
+$('endBtn').addEventListener('click', () => {
+  const what = state.then === 'shutdown' ? 'shut down' : 'go to sleep';
+  if (confirm(`End the session now? The Mac will ${what} and this page will lose connection.`)) act('end', {});
+});
+$('tokenForm').addEventListener('submit', (e) => {
+  e.preventDefault();
+  token = $('tokenInput').value.trim();
+  store.set('lidwake-token', token);
+  refresh();
+});
+
+refresh();
+setInterval(refresh, 4000);
+setInterval(tick, 1000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+</script>
+</body>
+</html>

@@ -1,0 +1,599 @@
+#!/bin/bash
+# lidwake — keep a MacBook awake with the lid closed (no external display needed)
+# until an event happens: Claude finishes, battery runs low, a process exits, ...
+#
+# Clamshell sleep without an external monitor can only be blocked with
+# `pmset -a disablesleep 1` (caffeinate can't do it). That needs root, so
+# install.sh adds a sudoers rule for exactly those pmset commands.
+#
+# A session's end conditions live in a file that the session re-reads every
+# few seconds, so they can be added/removed/extended while it runs — from this
+# CLI, the menu bar app or the remote web UI (lidwaked).
+
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH
+
+STATE_DIR="$HOME/Library/Application Support/LidWake"
+PID_FILE="$STATE_DIR/session.pid"
+STARTED_FILE="$STATE_DIR/session.started"
+COND_FILE="$STATE_DIR/conditions"      # id<TAB>type<TAB>arg<TAB>label
+NEXT_ID_FILE="$STATE_DIR/next_id"
+THEN_FILE="$STATE_DIR/then"
+LAST_FILE="$STATE_DIR/last"            # epoch<TAB>reason
+SIG_DIR="$STATE_DIR/signals"
+LOCK_DIR="$STATE_DIR/start.lock"
+LOG_FILE="$STATE_DIR/lidwake.log"
+CONFIG_FILE="$STATE_DIR/config"        # KEY=value lines: NTFY_URL, REMOTE_PORT, PUBLIC
+TOKEN_FILE="$STATE_DIR/remote.token"
+PUBLIC_URL_FILE="$STATE_DIR/public.url"     # internet address of the web UI, if enabled
+PMSET=/usr/bin/pmset
+POLL=5
+
+mkdir -p "$SIG_DIR"
+
+usage() {
+  cat <<'EOF'
+lidwake — keep your Mac awake with the lid closed until something happens
+
+Session:
+  lidwake start [events] [options]   start (ends at the FIRST event that happens)
+  lidwake add [events] [options]     add events to the running session
+  lidwake remove ID                  remove an event (IDs from `lidwake status`)
+  lidwake extend ID DURATION         push a timer back, e.g. extend 3 30m
+  lidwake set then ACTION            change what happens at the end
+  lidwake stop                       end now, allow sleep, do nothing else
+  lidwake end                        end now and run the --then action
+  lidwake status [--short|--json]
+
+Events (combine any):
+  --claude             Claude Code finishes a reply (needs the hook, see claude-hook)
+  --pid PID            process PID exits
+  --process NAME       all processes named NAME exit (e.g. --process rsync)
+  --for DURATION       time passes: 90m, 2h, 1h30m (bare number = minutes)
+  --at HH:MM           clock time reached
+  --file PATH          PATH appears
+  --cmd 'COMMAND'      COMMAND exits 0 (checked every 5s, keep it quick)
+  --signal NAME        `lidwake signal NAME` is run
+  --unplug             power adapter disconnected
+
+Options:
+  --battery N          end when battery <= N% (default 10, 0 = off)
+  --max DURATION       safety limit (default 12h unless --for/--at given, 0 = none)
+  --then ACTION        afterwards: sleep (default), shutdown, none
+  -b, --background     detach from the terminal
+
+Other:
+  lidwake signal NAME            fire a signal (used by the Claude hook)
+  lidwake claude-hook [--install]  show / install the Claude Code Stop hook
+  lidwake remote [--url|--new-token]  remote control web address
+  lidwake remote --public cloudflare|tailscale|off   reach it from anywhere
+  lidwake recover                re-enable sleep if a session died
+
+Examples:
+  lidwake start --claude -b
+  lidwake start --process ffmpeg --battery 20 --then shutdown
+  lidwake add --for 1h
+EOF
+}
+
+log() {
+  local line
+  line="$(date '+%Y-%m-%d %H:%M:%S') $*"
+  echo "$line" >>"$LOG_FILE"
+  [ -t 2 ] && echo "$line" >&2
+}
+
+die() { echo "lidwake: $*" >&2; exit 1; }
+
+config_get() { [ -f "$CONFIG_FILE" ] && sed -n "s/^$1=//p" "$CONFIG_FILE" | tail -1; }
+
+# Local notification, plus a push to your phone if NTFY_URL is set in the config.
+notify() {
+  local msg=${1//\"/\'} url
+  osascript -e "display notification \"$msg\" with title \"LidWake\"" >/dev/null 2>&1
+  url=$(config_get NTFY_URL)
+  [ -n "$url" ] && curl -fsS -m 10 -H "Title: LidWake" -d "$1" "$url" >/dev/null 2>&1
+}
+
+sleep_disabled() { $PMSET -g | awk '/SleepDisabled/ {print $2}' | grep -q 1; }
+set_disablesleep() { sudo -n "$PMSET" -a disablesleep "$1" >/dev/null 2>&1; }
+battery_pct() { $PMSET -g batt | grep -Eo '[0-9]+%' | head -1 | tr -d '%'; }
+on_ac() { $PMSET -g batt | head -1 | grep -q "AC Power"; }
+
+session_pid() { [ -f "$PID_FILE" ] && cat "$PID_FILE"; }
+
+is_running() {
+  local pid
+  pid=$(session_pid) || return 1
+  [ -n "$pid" ] && ps -p "$pid" -o command= 2>/dev/null | grep -q lidwake
+}
+
+require_running() { is_running || die "no session running — use: lidwake start"; }
+
+require_shutdown_allowed() {
+  sudo -n -l /sbin/shutdown -h now >/dev/null 2>&1 || die "shutdown not allowed — run install.sh first"
+}
+
+# Durations: 90s, 45m, 2h, 1h30m; a bare number means minutes.
+to_seconds() {
+  local s=$1 total=0 n
+  if [[ $s =~ ^[0-9]+$ ]]; then echo $((s * 60)); return; fi
+  while [[ $s =~ ^([0-9]+)([hms])(.*)$ ]]; do
+    n=${BASH_REMATCH[1]}
+    case ${BASH_REMATCH[2]} in
+      h) total=$((total + n * 3600)) ;;
+      m) total=$((total + n * 60)) ;;
+      s) total=$((total + n)) ;;
+    esac
+    s=${BASH_REMATCH[3]}
+  done
+  [ -z "$s" ] && [ "$total" -gt 0 ] || return 1
+  echo "$total"
+}
+
+# Next occurrence of HH:MM as an epoch time.
+at_epoch() {
+  [[ $1 =~ ^[0-9]{1,2}:[0-9]{2}$ ]] || return 1
+  local t
+  t=$(date -j -f "%H:%M:%S" "$1:00" +%s 2>/dev/null) || return 1
+  [ "$t" -le "$(date +%s)" ] && t=$((t + 86400))
+  echo "$t"
+}
+
+fmt_time() { date -r "$1" '+%H:%M'; }
+
+# ---- event parsing (shared by start and add) --------------------------------
+# Sets PARSED (type<TAB>arg<TAB>label lines), P_THEN, P_BG, P_BATT, P_MAX, P_TIMER.
+
+add_parsed() { PARSED="$PARSED$1"$'\t'"$2"$'\t'"$3"$'\n'; }
+
+parse_args() {
+  PARSED="" P_THEN="" P_BG=0 P_BATT="" P_MAX="" P_TIMER=0
+  local v d
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -b|--background) P_BG=1; shift; continue ;;
+      --claude) add_parsed signal claude "Claude finishes a reply"; shift; continue ;;
+      --unplug) add_parsed unplug - "Charger is unplugged"; shift; continue ;;
+    esac
+    v=${2:-}
+    [ -n "$v" ] || die "$1 needs a value"
+    case $v in *$'\t'*|*$'\n'*) die "values can't contain tabs or newlines" ;; esac
+    case $1 in
+      --signal)  [[ $v =~ ^[A-Za-z0-9_-]+$ ]] || die "bad signal name: $v"
+                 add_parsed signal "$v" "Signal '$v'" ;;
+      --pid)     [[ $v =~ ^[0-9]+$ ]] && ps -p "$v" >/dev/null || die "no process with pid $v"
+                 add_parsed pid "$v" "Process $v ($(ps -p "$v" -o comm= | xargs basename)) exits" ;;
+      --process) pgrep -x "$v" >/dev/null || die "no running process named '$v'"
+                 add_parsed process "$v" "'$v' exits" ;;
+      --file)    add_parsed file "$v" "$v appears" ;;
+      --cmd)     add_parsed cmd "$v" "\`$v\` succeeds" ;;
+      --for)     d=$(to_seconds "$v") || die "bad duration: $v"
+                 add_parsed deadline $(( $(date +%s) + d )) "Timer"; P_TIMER=1 ;;
+      --at)      d=$(at_epoch "$v") || die "bad time (use HH:MM): $v"
+                 add_parsed deadline "$d" "Clock time"; P_TIMER=1 ;;
+      --battery) [[ $v =~ ^[0-9]+$ ]] && [ "$v" -le 100 ] || die "bad battery %: $v"
+                 P_BATT=$v ;;
+      --max)     P_MAX=$(to_seconds "$v") || die "bad duration: $v" ;;
+      --then)    case $v in sleep|shutdown|none) P_THEN=$v ;; *) die "--then must be sleep, shutdown or none" ;; esac ;;
+      *)         die "unknown option: $1 (see: lidwake help)" ;;
+    esac
+    shift 2
+  done
+}
+
+# ---- condition file ---------------------------------------------------------
+
+append_conditions() {
+  local line id
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    id=$(cat "$NEXT_ID_FILE" 2>/dev/null); [[ $id =~ ^[0-9]+$ ]] || id=1
+    echo $((id + 1)) >"$NEXT_ID_FILE"
+    printf '%s\t%s\n' "$id" "$line" >>"$COND_FILE"
+  done <<<"$1"
+}
+
+rewrite_conditions() {  # rewrite_conditions [awk args...] PROGRAM
+  local tmp="$COND_FILE.tmp.$$"
+  awk -F'\t' "${@:1:$#-1}" 'BEGIN{OFS="\t"} '"${@: -1}" "$COND_FILE" >"$tmp" && mv "$tmp" "$COND_FILE"
+}
+
+remove_type() { rewrite_conditions -v t="$1" '$2 != t'; }
+
+set_battery() {
+  remove_type battery
+  [ "$1" -gt 0 ] && append_conditions "battery"$'\t'"$1"$'\t'"Battery drops to $1%"
+}
+
+set_limit() {
+  remove_type limit
+  [ "$1" -gt 0 ] && append_conditions "limit"$'\t'"$(( $(date +%s) + $1 ))"$'\t'"Safety limit"
+}
+
+# Sets $reason if the session should end. Updates $was_ac (for --unplug).
+check_reason() {
+  local id type arg label now pct
+  now=$(date +%s)
+  [ -e "$SIG_DIR/force" ] && { reason="ended on request"; return; }
+  [ -e "$SIG_DIR/thermal" ] && { reason="Mac got too hot"; return; }
+  on_ac && was_ac=1
+  [ -f "$COND_FILE" ] || return
+  while IFS=$'\t' read -r id type arg label; do
+    case $type in
+      signal)   if [ -e "$SIG_DIR/$arg" ]; then
+                  if [ "$arg" = claude ]; then reason="Claude finished its reply"; else reason="signal '$arg' received"; fi
+                fi ;;
+      pid)      ps -p "$arg" >/dev/null 2>&1 || reason="process $arg exited" ;;
+      process)  pgrep -x "$arg" >/dev/null || reason="'$arg' exited" ;;
+      file)     [ -e "$arg" ] && reason="$arg appeared" ;;
+      cmd)      /bin/bash -c "$arg" </dev/null >/dev/null 2>&1 && reason="command succeeded: $arg" ;;
+      deadline|limit) [ "$now" -ge "$arg" ] && reason="$label reached" ;;
+      unplug)   [ "$was_ac" -eq 1 ] && ! on_ac && reason="charger unplugged" ;;
+      battery)  if ! on_ac; then
+                  pct=$(battery_pct)
+                  [ -n "$pct" ] && [ "$pct" -le "$arg" ] && reason="battery at $pct%"
+                fi ;;
+    esac
+    [ -n "$reason" ] && return
+  done <"$COND_FILE"
+}
+
+# ---- session lifecycle ------------------------------------------------------
+
+finish() {  # finish REASON ACTION
+  trap - INT TERM HUP EXIT
+  set_disablesleep 0 || log "WARNING: could not re-enable sleep; run: sudo pmset -a disablesleep 0"
+  printf '%s\t%s\n' "$(date +%s)" "$1" >"$LAST_FILE"
+  rm -f "$PID_FILE" "$STARTED_FILE" "$COND_FILE" "$SIG_DIR"/*
+  log "ended: $1 (then: $2)"
+  case $2 in
+    sleep)    notify "Ended: $1 — going to sleep"; $PMSET sleepnow >/dev/null ;;
+    shutdown) notify "Ended: $1 — shutting down"; sudo -n /sbin/shutdown -h now ;;
+    *)        notify "Ended: $1" ;;
+  esac
+  exit 0
+}
+
+run_session() {
+  echo $$ >"$PID_FILE"
+  date +%s >"$STARTED_FILE"
+  rmdir "$LOCK_DIR" 2>/dev/null
+  trap 'finish "stopped manually" none' INT TERM HUP
+  trap 'set_disablesleep 0' EXIT
+  set_disablesleep 1 || { rm -f "$PID_FILE" "$STARTED_FILE"; die "failed to disable sleep"; }
+  caffeinate -i -w $$ &
+
+  local was_ac=0 reason="" summary
+  summary=$(cut -f4 "$COND_FILE" 2>/dev/null | paste -sd ',' - | sed 's/,/, /g')
+  log "started (pid $$): until ${summary:-lidwake stop}; then $(cat "$THEN_FILE")"
+  notify "Staying awake with the lid closed until: ${summary:-you stop it}"
+
+  while :; do
+    check_reason
+    [ -n "$reason" ] && break
+    sleep "$POLL" &
+    wait $!   # lets the TERM trap fire immediately
+  done
+  finish "$reason" "$(cat "$THEN_FILE" 2>/dev/null || echo sleep)"
+}
+
+cmd_start() {
+  parse_args "$@"
+  mkdir "$LOCK_DIR" 2>/dev/null || {
+    # a lock older than a minute is left over from a crash
+    [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +1 2>/dev/null)" ] || die "another start is in progress"
+  }
+  trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+
+  is_running && die "a session is already running — use: lidwake add / lidwake stop"
+  cmd_recover
+  sudo -n -l "$PMSET" -a disablesleep 1 >/dev/null 2>&1 \
+    || die "can't change sleep settings without a password — run install.sh first"
+  [ "$P_THEN" = shutdown ] && require_shutdown_allowed
+
+  : >"$COND_FILE"
+  rm -f "$SIG_DIR"/*
+  append_conditions "$PARSED"
+  set_battery "${P_BATT:-10}"
+  if [ -n "$P_MAX" ]; then set_limit "$P_MAX"
+  elif [ "$P_TIMER" -eq 0 ]; then set_limit 43200
+  fi
+  echo "${P_THEN:-sleep}" >"$THEN_FILE"
+
+  if [ "$P_BG" -eq 1 ]; then
+    nohup "$0" _run >>"$LOG_FILE" 2>&1 </dev/null &
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do is_running && break; sleep 0.3; done
+    is_running || die "failed to start — see $LOG_FILE"
+    echo "LidWake is keeping the Mac awake. Events:"
+    print_conditions
+    echo "Stop with: lidwake stop"
+    return
+  fi
+  run_session
+}
+
+cmd_add() {
+  require_running
+  parse_args "$@"
+  [ -n "$PARSED$P_BATT$P_MAX$P_THEN" ] || die "nothing to add (see: lidwake help)"
+  [ "$P_THEN" = shutdown ] && require_shutdown_allowed
+  append_conditions "$PARSED"
+  [ -n "$P_BATT" ] && set_battery "$P_BATT"
+  [ -n "$P_MAX" ] && set_limit "$P_MAX"
+  [ -n "$P_THEN" ] && echo "$P_THEN" >"$THEN_FILE"
+  log "updated events: $*"
+  print_conditions
+}
+
+cmd_remove() {
+  require_running
+  [[ $1 =~ ^[0-9]+$ ]] && grep -q "^$1"$'\t' "$COND_FILE" || die "no event #$1 (see: lidwake status)"
+  rewrite_conditions -v i="$1" '$1 != i'
+  log "removed event #$1"
+}
+
+cmd_extend() {
+  require_running
+  local d
+  awk -F'\t' -v i="$1" '$1 == i && ($2 == "deadline" || $2 == "limit") {f=1} END {exit !f}' "$COND_FILE" \
+    || die "event #$1 isn't a timer"
+  d=$(to_seconds "$2") || die "bad duration: $2"
+  rewrite_conditions -v i="$1" -v d="$d" -v now="$(date +%s)" \
+    '{ if ($1 == i) $3 = ($3 > now ? $3 : now) + d; print }'
+  log "extended event #$1 by $2"
+}
+
+cmd_set() {
+  [ "$1" = then ] || die "usage: lidwake set then sleep|shutdown|none"
+  case $2 in sleep|none) ;; shutdown) require_shutdown_allowed ;; *) die "action must be sleep, shutdown or none" ;; esac
+  echo "$2" >"$THEN_FILE"
+  log "then-action set to $2"
+}
+
+wait_until_stopped() {
+  local i
+  for i in $(seq 1 20); do is_running || return 0; sleep 0.5; done
+  return 1
+}
+
+cmd_stop() {
+  is_running && kill -TERM "$(session_pid)" && wait_until_stopped
+  cmd_recover
+  echo "LidWake stopped; normal sleep is back on."
+}
+
+cmd_end() {
+  require_running
+  touch "$SIG_DIR/force"
+  wait_until_stopped || die "session didn't end — try: lidwake stop"
+  echo "Session ended."
+}
+
+# ---- status -----------------------------------------------------------------
+
+describe() {  # describe TYPE ARG — extra detail for a condition
+  local left
+  case $1 in
+    deadline|limit)
+      left=$(( $2 - $(date +%s) )); [ "$left" -lt 0 ] && left=0
+      printf 'at %s (%dh %02dm left)' "$(fmt_time "$2")" $((left / 3600)) $((left % 3600 / 60)) ;;
+  esac
+}
+
+print_conditions() {
+  local id type arg label
+  [ -s "$COND_FILE" ] || { echo "  (none — runs until you stop it)"; return; }
+  while IFS=$'\t' read -r id type arg label; do
+    printf '  #%-3s %s %s\n' "$id" "$label" "$(describe "$type" "$arg")"
+  done <"$COND_FILE"
+}
+
+json_esc() { local s=${1//\\/\\\\}; s=${s//\"/\\\"}; printf '%s' "$s"; }
+
+cmd_status_json() {
+  local active=false started=null batt ac=false sd=false sep="" id type arg label
+  if is_running; then active=true; started=$(cat "$STARTED_FILE" 2>/dev/null || echo null); fi
+  batt=$(battery_pct); [ -n "$batt" ] || batt=null
+  on_ac && ac=true
+  sleep_disabled && sd=true
+  printf '{"active":%s,"started":%s,"now":%s,"then":"%s","battery":%s,"ac":%s,"sleepDisabled":%s,"host":"%s","conditions":[' \
+    "$active" "$started" "$(date +%s)" "$(cat "$THEN_FILE" 2>/dev/null || echo sleep)" \
+    "$batt" "$ac" "$sd" "$(json_esc "$(scutil --get ComputerName 2>/dev/null)")"
+  if [ "$active" = true ] && [ -f "$COND_FILE" ]; then
+    while IFS=$'\t' read -r id type arg label; do
+      printf '%s{"id":%s,"type":"%s","arg":"%s","label":"%s"}' "$sep" "$id" "$type" "$(json_esc "$arg")" "$(json_esc "$label")"
+      sep=,
+    done <"$COND_FILE"
+  fi
+  printf '],"last":'
+  if [ -f "$LAST_FILE" ]; then
+    IFS=$'\t' read -r id label <"$LAST_FILE"
+    printf '{"at":%s,"reason":"%s"}' "$id" "$(json_esc "$label")"
+  else
+    printf null
+  fi
+  printf '}\n'
+}
+
+cmd_status() {
+  case $1 in
+    --json) cmd_status_json; return ;;
+    --short)
+      if is_running; then printf 'active\t%s\n' "$(cut -f4 "$COND_FILE" | paste -sd ',' - | sed 's/,/, /g')"
+      else echo idle; fi
+      return ;;
+  esac
+  if is_running; then
+    local started; started=$(cat "$STARTED_FILE" 2>/dev/null)
+    echo "Active since $(fmt_time "$started") — ends at the first of:"
+    print_conditions
+    echo "Then: $(cat "$THEN_FILE")"
+  else
+    echo "Idle — Mac sleeps normally when the lid closes."
+    [ -f "$LAST_FILE" ] && echo "Last session ended $(fmt_time "$(cut -f1 "$LAST_FILE")"): $(cut -f2 "$LAST_FILE")"
+  fi
+  local pct; pct=$(battery_pct)
+  [ -n "$pct" ] && echo "Battery: $pct% ($(on_ac && echo 'on AC' || echo 'on battery'))"
+  echo "SleepDisabled: $(sleep_disabled && echo 1 || echo 0)"
+}
+
+# ---- misc -------------------------------------------------------------------
+
+cmd_signal() {
+  [[ $1 =~ ^[A-Za-z0-9_-]+$ ]] || die "usage: lidwake signal NAME"
+  is_running || exit 0   # no session: nothing to do (keeps the Claude hook silent)
+  touch "$SIG_DIR/$1"
+}
+
+cmd_recover() {
+  is_running && return
+  rm -f "$PID_FILE" "$STARTED_FILE"
+  if sleep_disabled; then
+    set_disablesleep 0 && log "recover: re-enabled sleep left disabled by a dead session"
+  fi
+}
+
+cmd_claude_hook() {
+  local settings="$HOME/.claude/settings.json" hook_cmd="/usr/local/bin/lidwake signal claude" js
+  if [ "$1" != "--install" ]; then
+    cat <<EOF
+Add this Stop hook to $settings (or run: lidwake claude-hook --install):
+
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "$hook_cmd" } ] }
+    ]
+  }
+}
+EOF
+    return
+  fi
+  mkdir -p "$(dirname "$settings")"
+  [ -f "$settings" ] && cp "$settings" "$settings.lidwake-backup"
+  js="$STATE_DIR/hook-install.js"
+  cat >"$js" <<'EOF'
+ObjC.import('Foundation');
+function run(argv) {
+  const [path, cmd] = argv;
+  let cfg = {};
+  const raw = $.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, null);
+  const text = raw.isNil() ? '' : ObjC.unwrap(raw);
+  if (text.trim()) cfg = JSON.parse(text);
+  cfg.hooks = cfg.hooks || {};
+  cfg.hooks.Stop = cfg.hooks.Stop || [];
+  if (cfg.hooks.Stop.some(g => (g.hooks || []).some(h => h.command === cmd))) return 'already installed';
+  cfg.hooks.Stop.push({ hooks: [{ type: 'command', command: cmd }] });
+  $(JSON.stringify(cfg, null, 2)).writeToFileAtomicallyEncodingError(path, true, $.NSUTF8StringEncoding, null);
+  return 'installed';
+}
+EOF
+  local out
+  out=$(osascript -l JavaScript "$js" "$settings" "$hook_cmd" 2>&1) || die "couldn't update $settings: $out"
+  echo "Claude Code Stop hook $out in $settings"
+}
+
+ensure_token() {
+  if [ ! -s "$TOKEN_FILE" ] || [ "$1" = new ]; then
+    od -An -tx1 -N16 /dev/urandom | tr -d ' \n' >"$TOKEN_FILE"
+    chmod 600 "$TOKEN_FILE"
+  fi
+}
+
+config_set() {
+  touch "$CONFIG_FILE"
+  grep -v "^$1=" "$CONFIG_FILE" >"$CONFIG_FILE.tmp"
+  echo "$1=$2" >>"$CONFIG_FILE.tmp"
+  mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+}
+
+first_executable() { local c; for c in "$@"; do command -v "$c" 2>/dev/null && return; done; return 1; }
+cloudflared_bin() { first_executable cloudflared /opt/homebrew/bin/cloudflared /usr/local/bin/cloudflared; }
+tailscale_bin() {
+  first_executable tailscale /opt/homebrew/bin/tailscale /usr/local/bin/tailscale \
+    /Applications/Tailscale.app/Contents/MacOS/Tailscale
+}
+remote_port() { local p; p=$(config_get REMOTE_PORT); echo "${p:-7878}"; }
+
+# Public (internet) access: lidwaked runs a Cloudflare quick tunnel itself and
+# writes its URL to PUBLIC_URL_FILE; Tailscale Funnel is set up once here.
+set_public() {
+  local ts url
+  case $1 in
+    cloudflare)
+      cloudflared_bin >/dev/null || die "cloudflared isn't installed — run: brew install cloudflared (or re-run install.sh)" ;;
+    tailscale)
+      ts=$(tailscale_bin) || die "Tailscale isn't installed — get it at https://tailscale.com/download/mac and sign in"
+      "$ts" funnel --bg "$(remote_port)" || die "couldn't enable Tailscale Funnel — approve it via the link above, then retry"
+      url=$("$ts" status --json --peers=false 2>/dev/null | grep -m1 '"DNSName"' | sed -E 's/.*"DNSName": *"([^"]*)\.?".*/\1/')
+      url=${url%.}
+      [ -n "$url" ] || die "couldn't read this Mac's Tailscale name"
+      ;;
+    off) ;;
+    *) die "usage: lidwake remote --public cloudflare|tailscale|off" ;;
+  esac
+  if [ "$(config_get PUBLIC)" = tailscale ] && [ "$1" != tailscale ]; then
+    ts=$(tailscale_bin) && "$ts" funnel reset >/dev/null 2>&1
+  fi
+  config_set PUBLIC "$1"
+  rm -f "$PUBLIC_URL_FILE"
+  [ "$1" = tailscale ] && echo "https://$url/" >"$PUBLIC_URL_FILE"
+  launchctl kickstart -k "gui/$(id -u)/com.lidwake.remote" >/dev/null 2>&1
+  if [ "$1" = cloudflare ]; then
+    local i
+    echo "Starting Cloudflare tunnel…"
+    for i in $(seq 1 30); do [ -s "$PUBLIC_URL_FILE" ] && break; sleep 0.5; done
+  fi
+}
+
+cmd_remote() {
+  local token port ip host pub mode
+  case $1 in
+    --new-token) ensure_token new; echo "New token created; old links stop working." ;;
+    --public)    set_public "$2" ;;
+  esac
+  ensure_token
+  token=$(cat "$TOKEN_FILE")
+  port=$(remote_port)
+  ip=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null)
+  host="$(scutil --get LocalHostName 2>/dev/null).local"
+  pub=$(cat "$PUBLIC_URL_FILE" 2>/dev/null)
+  mode=$(config_get PUBLIC); mode=${mode:-off}
+
+  if [ "$1" = "--url" ]; then echo "${pub:-http://${ip:-$host}:$port/}#t=$token"; return; fi
+
+  echo "From any device, anywhere:"
+  if [ -n "$pub" ]; then
+    echo "  $pub#t=$token"
+    [ "$mode" = cloudflare ] && echo "  (Cloudflare quick-tunnel address — it changes when the Mac restarts)"
+  elif [ "$mode" = off ]; then
+    echo "  off — enable with: lidwake remote --public cloudflare   (or: --public tailscale)"
+  else
+    echo "  tunnel is starting or failing — see ~/Library/Application Support/LidWake/com.lidwake.remote.log"
+  fi
+  echo "On the same network:"
+  echo "  http://${ip:-$host}:$port/#t=$token"
+  echo "Links contain your access token — don't share them. Reset: lidwake remote --new-token"
+  launchctl print "gui/$(id -u)/com.lidwake.remote" >/dev/null 2>&1 \
+    || echo "Note: the remote server (lidwaked) isn't running — re-run install.sh."
+}
+
+case "${1:-help}" in
+  start)       shift; cmd_start "$@" ;;
+  add)         shift; cmd_add "$@" ;;
+  remove|rm)   cmd_remove "${2:-}" ;;
+  extend)      cmd_extend "${2:-}" "${3:-}" ;;
+  set)         cmd_set "${2:-}" "${3:-}" ;;
+  stop)        cmd_stop ;;
+  end)         cmd_end ;;
+  status)      cmd_status "${2:-}" ;;
+  signal)      cmd_signal "${2:-}" ;;
+  claude-hook) cmd_claude_hook "${2:-}" ;;
+  remote)      shift; cmd_remote "$@" ;;
+  recover)     cmd_recover ;;
+  _run)        run_session ;;
+  _notify)     notify "${2:-}" ;;
+  help|-h|--help) usage ;;
+  *)           usage >&2; exit 1 ;;
+esac
