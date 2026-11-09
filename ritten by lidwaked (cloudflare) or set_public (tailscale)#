@@ -1,2 +1,0 @@
-TOKEN_FILE="$STATE_DIR/remote.token"
-PUBLIC_URL_FILE="$STATE_DIR/public.url"   
