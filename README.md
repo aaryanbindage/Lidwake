@@ -97,9 +97,11 @@ The installer uses the hosted relay by default. Because of the encryption, that 
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/aaryanbindage/Lidwake)
 
-1. Click the button, or in Render go to **New → Blueprint** and pick this repo. It uses `render.yaml`: a free Node web service called `lidwake-relay` and a free Postgres database `lidwake-db` for accounts, which is reachable only from the service.
-   - Render's free Postgres **expires 30 days after it's created**. Upgrade it to a paid plan in the Render dashboard to keep accounts, or set `DATABASE_URL` to any other Postgres (Neon, Supabase, …).
-   - Without a database, the relay still works; the page just doesn't offer accounts. Self-hosting with a persistent disk can use `ACCOUNTS_FILE=/path/accounts.json` instead of Postgres.
+1. Click the button, or in Render go to **New → Blueprint** and pick this repo. It uses `render.yaml`: a free Node web service called `lidwake-relay`. Render asks for **`DATABASE_URL`**, the Postgres database that accounts are stored in:
+   - **Supabase (free):** create a project, then go to **Connect → Session pooler** and copy the URI. Replace `[YOUR-PASSWORD]` with the database password, URL-encoding any special characters (`@` → `%40`, for example). Use the pooler, not the "direct connection" address, which is IPv6-only and unreachable from Render.
+   - Any other Postgres works too. SSL is used automatically for non-local hosts. The relay creates its tables on startup and turns on row level security, so Supabase's public Data API can't read them.
+   - Leave it empty to run the relay without accounts. Self-hosting with a persistent disk can use `ACCOUNTS_FILE=/path/accounts.json` instead.
+   - To add or change it later, go to **lidwake-relay → Environment** in Render.
 2. Copy the service URL Render gives you, e.g. `https://lidwake-relay.onrender.com`.
 3. On each Mac, run `lidwake remote --public relay https://lidwake-relay.onrender.com`. Or install with `RELAY_URL=… bash install.sh`.
 4. To make your relay the default for everyone who installs from your copy of the repo, put its URL in `DEFAULT_RELAY_URL` near the top of `lidwake`.

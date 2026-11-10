@@ -12,8 +12,21 @@ const MAX_ITEMS = 50;   // Macs per account
 
 class LimitError extends Error {}
 
+// SSL for anything that isn't local or a Render-internal host (no dots, e.g. dpg-xxx-a).
+// Hosted Postgres like Supabase uses its own CA, so the default is encrypted but
+// unverified; add ?sslmode=verify-full to verify, or ?sslmode=disable to turn SSL off.
+function pgConfig(url) {
+  const u = new URL(url);
+  const mode = u.searchParams.get('sslmode');
+  u.searchParams.delete('sslmode');
+  const local = /^(localhost|127\.0\.0\.1|[^.]+)$/.test(u.hostname);
+  const ssl = mode === 'disable' || (!mode && local) ? false : { rejectUnauthorized: mode === 'verify-full' };
+  return { connectionString: u.toString(), ssl };
+}
+
 function pgStore(url, pgModule = require('pg')) {
-  const pool = new pgModule.Pool({ connectionString: url, max: 5 });
+  const pool = new pgModule.Pool({ ...pgConfig(url), max: 5 });
+  pool.on('error', (e) => console.error('postgres:', e.message));
   const q = (text, params) => pool.query(text, params);
   return {
     kind: 'postgres',
@@ -27,6 +40,10 @@ function pgStore(url, pgModule = require('pg')) {
       await q(`create table if not exists vault (
         email text not null references users(email) on delete cascade, id text not null,
         blob text not null, updated timestamptz not null default now(), primary key (email, id))`);
+      // Supabase exposes the public schema through its Data API. Row level security with
+      // no policies blocks that API completely; the relay connects as the table owner,
+      // which RLS doesn't apply to.
+      for (const t of ['users', 'sessions', 'vault']) await q(`alter table ${t} enable row level security`);
     },
     async createUser(email, salt, auth) {
       const r = await q('insert into users (email, salt, auth) values ($1, $2, $3) on conflict do nothing', [email, salt, auth]);
@@ -119,4 +136,4 @@ function openStore(env = process.env) {
   return null;
 }
 
-module.exports = { openStore, pgStore, fileStore, LimitError, MAX_ITEMS };
+module.exports = { openStore, pgStore, pgConfig, fileStore, LimitError, MAX_ITEMS };
