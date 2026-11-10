@@ -121,4 +121,10 @@ echo
 echo "Done. Try:  lidwake start --for 30m -b   then close the lid."
 echo "Claude Code:  lidwake claude-hook --install"
 [ -x "$BIN/lidwaked" ] && { echo; "$BIN/lidwake" remote; }
+if [ -x "$BIN/lidwaked" ] && [ "$(sed -n 's/^PUBLIC=//p' "$STATE/config" 2>/dev/null | tail -1)" = relay ]; then
+  echo
+  echo "→ Opening the remote page. Sign in or create an account there to add this Mac to it;"
+  echo "  after that, signing in on any device takes you straight to this Mac."
+  "$BIN/lidwake" remote --open >/dev/null 2>&1 || true
+fi
 true

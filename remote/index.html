@@ -69,11 +69,17 @@
   button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   code { font-size: 13px; background: var(--chip); padding: 1px 5px; border-radius: 5px; }
   [hidden] { display: none !important; }
+  .hdr { display: flex; align-items: center; gap: 8px; }
+  #macSelect { width: 100%; margin-bottom: 14px; }
+  .btns { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  .btns button { flex: 1; }
+  #loginSeg { margin-bottom: 0; }
+  #loginForm { margin-top: 12px; padding-top: 0; }
 
   /* Desktop / tablet: events on the right, controls on the left. */
   @media (min-width: 860px) {
     main { max-width: 980px; padding-top: 32px; }
-    #auth { max-width: 520px; }
+    .narrow { max-width: 520px; }
     #app {
       display: grid; column-gap: 18px; align-items: start;
       grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr);
@@ -89,14 +95,49 @@
 <main>
   <header>
     <h1>LidWake</h1>
-    <span id="pill" class="pill">…</span>
+    <div class="hdr">
+      <span id="pill" class="pill">…</span>
+      <button id="acctBtn" class="small" hidden>Sign in</button>
+    </div>
   </header>
 
   <div id="banner" class="banner err" hidden></div>
+  <select id="macSelect" class="narrow" aria-label="Mac" hidden></select>
 
-  <section id="auth" class="card" hidden>
-    <p class="big">Connect to your Mac</p>
-    <p class="muted">Run <code>lidwake remote</code> on the Mac and open the link it prints, or paste that link here.</p>
+  <section id="acct" class="card narrow" hidden>
+    <h2>Account</h2>
+    <p id="acctEmail" class="muted" style="margin:0"></p>
+    <h2 style="margin-top:16px">Your Macs</h2>
+    <ul id="macList"></ul>
+    <p class="hint">To add a Mac, run <code>lidwake remote --open</code> on it, or open its link on any device while you’re signed in. Its link is saved to your account, encrypted with your password.</p>
+    <div class="btns">
+      <button id="signOutBtn">Sign out</button>
+      <button id="delAcctBtn" class="danger">Delete account</button>
+    </div>
+    <form id="deleteForm" class="add" hidden>
+      <div class="row">
+        <input id="delPw" type="password" autocomplete="current-password" placeholder="Password, to confirm" aria-label="Password">
+        <button class="danger">Delete</button>
+      </div>
+    </form>
+  </section>
+
+  <section id="login" class="card narrow" hidden>
+    <div id="loginSeg" class="seg" role="tablist">
+      <button type="button" data-m="signin" role="tab">Sign in</button>
+      <button type="button" data-m="signup" role="tab">Create account</button>
+    </div>
+    <form id="loginForm" class="add" style="border:0">
+      <input id="email" type="email" autocomplete="username" autocapitalize="off" spellcheck="false" placeholder="Email" aria-label="Email" required>
+      <input id="password" type="password" autocomplete="current-password" placeholder="Password" aria-label="Password" minlength="8" required>
+      <button id="loginBtn" class="primary">Sign in</button>
+    </form>
+    <p id="loginHint" class="hint"></p>
+  </section>
+
+  <section id="auth" class="card narrow" hidden>
+    <p id="authTitle" class="big">Connect to your Mac</p>
+    <p id="authText" class="muted">Run <code>lidwake remote</code> on the Mac and open the link it prints, or paste that link here.</p>
     <form id="tokenForm" class="add" style="border:0;padding:0">
       <div class="row">
         <input id="tokenInput" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="link or token">
@@ -153,6 +194,7 @@ const $ = (id) => document.getElementById(id);
 const store = {
   get(k) { try { return localStorage.getItem(k); } catch { return null; } },
   set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+  del(k) { try { localStorage.removeItem(k); } catch {} },
 };
 
 // Two ways to reach the Mac:
@@ -238,9 +280,9 @@ function relayKey() {
 }
 
 // Wire format: base64(iv[12] | ciphertext | tag[16]) — matches CryptoKit's AES.GCM "combined".
-async function seal(obj) {
+async function sealWith(key, obj) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, await relayKey(),
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key,
     new TextEncoder().encode(JSON.stringify(obj))));
   const out = new Uint8Array(iv.length + ct.length);
   out.set(iv);
@@ -248,11 +290,13 @@ async function seal(obj) {
   return toB64(out);
 }
 
-async function unseal(text) {
+async function unsealWith(key, text) {
   const data = fromB64(text);
-  const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: data.slice(0, 12) }, await relayKey(), data.slice(12));
+  const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: data.slice(0, 12) }, key, data.slice(12));
   return JSON.parse(new TextDecoder().decode(plain));
 }
+const seal = async (obj) => sealWith(await relayKey(), obj);
+const unseal = async (text) => unsealWith(await relayKey(), text);
 
 async function relayCall(path, body) {
   const nonce = toB64(crypto.getRandomValues(new Uint8Array(16)));
@@ -269,6 +313,159 @@ async function relayCall(path, body) {
   if (reply.nonce !== nonce) throw new Error('The reply didn’t match the request — try again.');
   if (reply.status >= 400) throw new Error((reply.body && reply.body.error) || 'Request failed');
   return reply.body;
+}
+
+// --- accounts (only on a relay that has a database) ---
+// The password never leaves this page. PBKDF2 + HKDF turn it into an auth key (sent, so the
+// relay knows it's you) and a vault key (kept here) that encrypts each saved Mac's {d, k, name}.
+let accountsOn = false;
+let account = null;        // { email, session, ek }
+try { account = JSON.parse(store.get('lidwake-account')); } catch {}
+let macs = [];             // decrypted vault: [{ d, k, name }]
+let vaultKeyPromise = null;
+let loginMode = 'signin';
+let acctOpen = false;
+const ITERATIONS = 600000;
+const utf8 = (s) => new TextEncoder().encode(s);
+
+async function deriveKeys(password, salt, iterations) {
+  const pw = await crypto.subtle.importKey('raw', utf8(password.normalize('NFKC')), 'PBKDF2', false, ['deriveBits']);
+  const master = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: fromB64(salt), iterations }, pw, 256);
+  const hk = await crypto.subtle.importKey('raw', master, 'HKDF', false, ['deriveBits']);
+  const part = async (info) => toB64(new Uint8Array(await crypto.subtle.deriveBits(
+    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: utf8('lidwake-' + info) }, hk, 256)));
+  return { auth: await part('auth'), ek: await part('vault') };
+}
+
+function vaultKey() {
+  return vaultKeyPromise ||= crypto.subtle.importKey('raw', fromB64(account.ek), 'AES-GCM', false, ['encrypt', 'decrypt']);
+}
+
+async function acctApi(method, path, body, signedIn = true) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (signedIn) headers.Authorization = 'Bearer ' + account.session;
+  const res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  const out = await res.json().catch(() => ({}));
+  if (res.status === 401 && signedIn) { forgetAccount(false); throw new Error(out.error || 'Sign in again.'); }
+  if (!res.ok) throw new Error(out.error || 'Request failed (' + res.status + ')');
+  return out;
+}
+
+async function signIn(mode, email, password) {
+  let salt, iterations = ITERATIONS;
+  if (mode === 'signup') salt = toB64(crypto.getRandomValues(new Uint8Array(16)));
+  else ({ salt, iterations } = await acctApi('POST', '/auth/params', { email }, false));
+  const keys = await deriveKeys(password, salt, iterations);
+  const out = await acctApi('POST', '/auth/' + (mode === 'signup' ? 'signup' : 'login'),
+    mode === 'signup' ? { email, salt, auth: keys.auth } : { email, auth: keys.auth }, false);
+  account = { email: out.email, session: out.session, ek: keys.ek };
+  vaultKeyPromise = null;
+  store.set('lidwake-account', JSON.stringify(account));
+  await loadMacs();
+}
+
+async function loadMacs() {
+  const out = await acctApi('GET', '/vault');
+  const key = await vaultKey();
+  const list = [];
+  for (const item of out.items) {
+    try { const m = await unsealWith(key, item.blob); if (m.d === item.id) list.push(m); } catch {}
+  }
+  macs = list;
+  if (creds && creds.mode === 'relay') await rememberMac(state && state.host);
+  else if (!creds && macs.length) useMac(macs.find((m) => m.d === store.get('lidwake-last')) || macs[macs.length - 1]);
+  renderAccount();
+}
+
+// Saves (or updates) the Mac this page is connected to in the account's vault.
+async function rememberMac(host) {
+  if (!account || !creds || creds.mode !== 'relay') return;
+  const known = macs.find((m) => m.d === creds.d);
+  const name = host || (known && known.name) || 'Mac';
+  if (known && known.k === creds.k && known.name === name) return;
+  const mac = { d: creds.d, k: creds.k, name };
+  await acctApi('PUT', '/vault/' + mac.d, { blob: await sealWith(await vaultKey(), mac) });
+  macs = macs.filter((m) => m.d !== mac.d).concat(mac);
+  renderAccount();
+}
+
+function useMac(mac) {
+  saveCreds({ mode: 'relay', d: mac.d, k: mac.k });
+  store.set('lidwake-last', mac.d);
+  state = null;
+  listKey = '';
+  $('app').hidden = true;
+  refresh();
+}
+
+function disconnect() {
+  creds = null;
+  keyPromise = null;
+  state = null;
+  store.del('lidwake-creds');
+}
+
+// forgetMacs: on sign-out, also forget the Mac this browser is connected to.
+function forgetAccount(forgetMacs) {
+  account = null;
+  macs = [];
+  vaultKeyPromise = null;
+  acctOpen = false;
+  store.del('lidwake-account');
+  if (forgetMacs) { disconnect(); showAuth(); }
+  renderAccount();
+}
+
+function renderAccount() {
+  $('acctBtn').hidden = !accountsOn;
+  $('acctBtn').textContent = account ? 'Account' : 'Sign in';
+  $('acct').hidden = !(acctOpen && account);
+  $('login').hidden = !(accountsOn && !account && (acctOpen || !creds));
+
+  const sel = $('macSelect');
+  sel.hidden = !(account && macs.length > 1 && creds);
+  sel.replaceChildren(...macs.map((m) => el('option', { value: m.d, textContent: m.name })));
+  if (creds) sel.value = creds.d;
+
+  $('acctEmail').textContent = account ? 'Signed in as ' + account.email : '';
+  $('macList').replaceChildren(...macs.map((m) => {
+    const current = creds && creds.d === m.d;
+    return el('li', { className: 'event' },
+      el('div', { className: 'txt' }, el('div', { textContent: m.name }),
+        current ? el('div', { className: 'muted', textContent: 'Connected' }) : null),
+      current ? null : el('button', { className: 'small', textContent: 'Open', onclick: () => { acctOpen = false; useMac(m); renderAccount(); } }),
+      el('button', { className: 'icon', textContent: '×', title: 'Remove from account', ariaLabel: 'Remove ' + m.name,
+        onclick: () => removeMac(m) }));
+  }));
+  if (!macs.length) $('macList').append(el('li', { className: 'empty', textContent: 'No Macs yet.' }));
+
+  const signup = loginMode === 'signup';
+  for (const b of $('loginSeg').children) b.className = b.dataset.m === loginMode ? 'sel' : '';
+  $('loginBtn').textContent = signup ? 'Create account' : 'Sign in';
+  $('password').autocomplete = signup ? 'new-password' : 'current-password';
+  $('loginHint').textContent = signup
+    ? 'Your password also encrypts your Macs’ links, so nobody else (not even this server) can read them. That means it can’t be reset: if you forget it, make a new account and open each Mac’s link again. Nothing is ever emailed to you.'
+    : 'Sign in to reach all your Macs from any device.';
+
+  if (!creds) {
+    $('authTitle').textContent = account ? 'Add your first Mac' : 'Connect to your Mac';
+    $('authText').replaceChildren('Run ', el('code', { textContent: account ? 'lidwake remote --open' : 'lidwake remote' }),
+      account ? ' on the Mac, or paste its link here. It’s saved to your account, so next time you just sign in.'
+        : ' on the Mac and open the link it prints, or paste that link here.');
+  }
+}
+
+async function removeMac(mac) {
+  if (!confirm(`Remove “${mac.name}” from your account? You can add it back by opening its link again.`)) return;
+  try {
+    await acctApi('DELETE', '/vault/' + mac.d);
+    macs = macs.filter((m) => m.d !== mac.d);
+    if (creds && creds.d === mac.d) {
+      disconnect();
+      if (macs.length) useMac(macs[macs.length - 1]); else showAuth();
+    }
+    renderAccount();
+  } catch (e) { showBanner(e.message); }
 }
 
 async function act(path, body) {
@@ -306,12 +503,14 @@ function apply(s) {
   $('auth').hidden = true;
   $('app').hidden = false;
   render();
+  if (account) rememberMac(s.host).catch(() => {});
 }
 
 function showAuth() {
   $('auth').hidden = false;
   $('app').hidden = true;
-  $('pill').textContent = 'Locked';
+  $('pill').textContent = account ? 'No Mac' : 'Locked';
+  renderAccount();
 }
 function showBanner(msg, kind = 'error') { const b = $('banner'); b.textContent = msg; b.dataset.kind = kind; b.hidden = false; }
 function hideBanner() { $('banner').hidden = true; $('banner').dataset.kind = ''; }
@@ -465,13 +664,73 @@ $('tokenForm').addEventListener('submit', (e) => {
   if (!parsed) return showBanner('That doesn’t look like a LidWake link or token.');
   saveCreds(parsed);
   hideBanner();
+  renderAccount();
   refresh();
 });
 
-refresh();
-setInterval(refresh, 4000);
-setInterval(tick, 1000);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+$('acctBtn').addEventListener('click', () => {
+  acctOpen = !acctOpen;
+  $('deleteForm').hidden = true;
+  renderAccount();
+  if (acctOpen && account) loadMacs().catch((e) => showBanner(e.message));
+});
+$('macSelect').addEventListener('change', (e) => {
+  const mac = macs.find((m) => m.d === e.target.value);
+  if (mac) useMac(mac);
+});
+$('loginSeg').addEventListener('click', (e) => {
+  if (!e.target.dataset.m) return;
+  loginMode = e.target.dataset.m;
+  renderAccount();
+});
+$('loginForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const btn = $('loginBtn');
+  btn.disabled = true;
+  btn.textContent = loginMode === 'signup' ? 'Creating account…' : 'Signing in…';
+  try {
+    await signIn(loginMode, $('email').value.trim(), $('password').value);
+    $('password').value = '';
+    acctOpen = false;
+    hideBanner();
+    renderAccount();
+    if (creds) refresh(); else showAuth();
+  } catch (err) {
+    showBanner(err.message);
+  } finally {
+    btn.disabled = false;
+    renderAccount();
+  }
+});
+$('signOutBtn').addEventListener('click', () => {
+  acctApi('POST', '/auth/logout').catch(() => {});
+  forgetAccount(true);
+});
+$('delAcctBtn').addEventListener('click', () => { $('deleteForm').hidden = false; $('delPw').focus(); });
+$('deleteForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if (!confirm('Delete your account and its saved Macs? Your Macs keep working through their links.')) return;
+  try {
+    const { salt, iterations } = await acctApi('POST', '/auth/params', { email: account.email }, false);
+    const { auth } = await deriveKeys($('delPw').value, salt, iterations);
+    await acctApi('POST', '/auth/delete', { auth });
+    $('delPw').value = '';
+    forgetAccount(true);
+  } catch (err) { showBanner(err.message); }
+});
+
+async function boot() {
+  try { accountsOn = !!(await (await fetch('/healthz')).json()).accounts; } catch {}
+  renderAccount();
+  if (accountsOn && account) {
+    try { await loadMacs(); } catch (e) { showBanner(e.message); }
+  }
+  refresh();
+  setInterval(refresh, 4000);
+  setInterval(tick, 1000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+}
+boot();
 </script>
 </body>
 </html>

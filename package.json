@@ -1,10 +1,13 @@
 {
   "name": "lidwake-relay",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
-  "description": "End-to-end encrypted relay for the LidWake remote control page",
+  "description": "End-to-end encrypted relay and optional accounts for the LidWake remote control page",
   "scripts": {
     "start": "node relay/server.js"
+  },
+  "dependencies": {
+    "pg": "8.23.1"
   },
   "engines": {
     "node": ">=18"

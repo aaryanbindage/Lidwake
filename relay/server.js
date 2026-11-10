@@ -3,12 +3,15 @@
 // accepting inbound connections. The Mac (lidwaked) long-polls this server;
 // browsers post requests that are end-to-end encrypted (AES-256-GCM) with a key
 // that only the Mac and the link's #fragment know. This server only ever sees
-// random device IDs and ciphertext, and keeps nothing on disk.
-// No dependencies. Deploy with ../render.yaml, or run: node relay/server.js
+// random device IDs and ciphertext. Optional accounts (accounts.js) keep each
+// user's Mac links in a database, encrypted in the browser with a key the server
+// never sees. Deploy with ../render.yaml, or run: node relay/server.js
 const http = require('http');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { openStore } = require('./store');
+const { createAccounts } = require('./accounts');
 
 const PORT = Number(process.env.PORT) || 10000;
 const PAGE = fs.readFileSync(path.join(__dirname, '..', 'remote', 'index.html'));
@@ -139,6 +142,13 @@ async function browserCall(id, req, res) {
   if (dev.waiter) releaseWaiter(dev, dev.queue.splice(0));
 }
 
+const store = openStore();
+if (!process.env.AUTH_PEPPER && store) console.warn('AUTH_PEPPER is not set; using a random one for this run');
+const accounts = store && createAccounts({
+  store, send, readBody, httpError,
+  pepper: process.env.AUTH_PEPPER || crypto.randomBytes(32).toString('hex'),
+});
+
 function page(res) {
   res.writeHead(200, {
     ...SECURITY_HEADERS,
@@ -154,7 +164,8 @@ const server = http.createServer(async (req, res) => {
   try {
     const { pathname } = new URL(req.url, 'http://relay');
     if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) return page(res);
-    if (pathname === '/healthz') return send(res, 200, { ok: true });
+    if (pathname === '/healthz') return send(res, 200, { ok: true, accounts: !!(accounts && accounts.enabled) });
+    if (accounts && await accounts.handle(req, res, pathname)) return;
     if (pathname === '/agent/poll' && req.method === 'GET') return agentPoll(req, res);
     if (pathname === '/agent/reply' && req.method === 'POST') return await agentReply(req, res);
     const m = pathname.match(/^\/api\/([0-9a-f]{32})$/);

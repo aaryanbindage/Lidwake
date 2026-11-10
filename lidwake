@@ -48,6 +48,7 @@ Session:
   lidwake stop                       end now, allow sleep, do nothing else
   lidwake end                        end now and run the --then action
   lidwake status [--short|--json]
+  COMMAND | lidwake [options]        stay awake until COMMAND finishes (output passes through)
 
 Events (combine any):
   --claude             Claude Code finishes a reply (needs the hook, see claude-hook)
@@ -69,7 +70,7 @@ Options:
 Other:
   lidwake signal NAME            fire a signal (used by the Claude hook)
   lidwake claude-hook [--install]  show / install the Claude Code Stop hook
-  lidwake remote [--url|--new-token]  remote control web address
+  lidwake remote [--url|--open|--new-token]  remote control web address
   lidwake remote --public relay URL|cloudflare|tailscale|off   reach it from anywhere
   lidwake recover                re-enable sleep if a session died
 
@@ -77,6 +78,7 @@ Examples:
   lidwake start --claude -b
   lidwake start --process ffmpeg --battery 20 --then shutdown
   lidwake add --for 1h
+  ./train.sh 2>&1 | lidwake --then shutdown
 EOF
 }
 
@@ -154,6 +156,7 @@ add_parsed() { PARSED="$PARSED$1"$'\t'"$2"$'\t'"$3"$'\n'; }
 parse_args() {
   PARSED="" P_THEN="" P_BG=0 P_BATT="" P_MAX="" P_TIMER=0
   local v d
+  [ -n "$PIPE_PID" ] && add_parsed pipe "$PIPE_PID" "Piped command finishes"
   while [ $# -gt 0 ]; do
     case $1 in
       -b|--background) P_BG=1; shift; continue ;;
@@ -229,6 +232,7 @@ check_reason() {
                   if [ "$arg" = claude ]; then reason="Claude finished its reply"; else reason="signal '$arg' received"; fi
                 fi ;;
       pid)      ps -p "$arg" >/dev/null 2>&1 || reason="process $arg exited" ;;
+      pipe)     ps -p "$arg" >/dev/null 2>&1 || reason="the piped command finished" ;;
       process)  pgrep -x "$arg" >/dev/null || reason="'$arg' exited" ;;
       file)     [ -e "$arg" ] && reason="$arg appeared" ;;
       cmd)      /bin/bash -c "$arg" </dev/null >/dev/null 2>&1 && reason="command succeeded: $arg" ;;
@@ -373,6 +377,35 @@ cmd_end() {
   touch "$SIG_DIR/force"
   wait_until_stopped || die "session didn't end — try: lidwake stop"
   echo "Session ended."
+}
+
+# `COMMAND | lidwake [options]`: the event is this reader process exiting, which
+# happens when COMMAND closes its output. Ctrl-C stops the session if the pipe
+# started it, or just drops the pipe's event from a session that was running.
+PIPE_PID="" PIPE_OWN=0 PIPE_CAT=""
+
+pipe_cancel() {
+  trap - INT TERM HUP
+  kill "$PIPE_CAT" 2>/dev/null
+  if [ "$PIPE_OWN" = 1 ]; then cmd_stop >&2
+  else rewrite_conditions -v p="$PIPE_PID" '!($2 == "pipe" && $3 == p)'; echo "lidwake: dropped the pipe event" >&2
+  fi
+  exit 130
+}
+
+cmd_pipe() {
+  local a
+  for a in "$@"; do case $a in -b|--background) die "a pipe can't run in the background" ;; esac; done
+  PIPE_PID=$$
+  if is_running; then ( cmd_add "$@" ) >&2 || exit 1
+  else ( cmd_start --background "$@" ) >&2 || exit 1; PIPE_OWN=1
+  fi
+  # Pass the output through; if our own output is closed (`| head`), keep draining.
+  # It runs in the background (stdin given explicitly) so a signal interrupts `wait`.
+  { cat 2>/dev/null || cat >/dev/null; } <&0 &
+  PIPE_CAT=$!
+  trap pipe_cancel INT TERM HUP
+  wait "$PIPE_CAT"
 }
 
 # ---- status -----------------------------------------------------------------
@@ -589,8 +622,12 @@ cmd_remote() {
   pub=$(cat "$PUBLIC_URL_FILE" 2>/dev/null)
   mode=$(config_get PUBLIC); mode=${mode:-off}
 
-  if [ "$1" = "--url" ]; then
-    if [ "$mode" = relay ]; then relay_link; else echo "${pub:-http://${ip:-$host}:$port/}#t=$token"; fi
+  if [ "$1" = "--url" ] || [ "$1" = "--open" ]; then
+    local link
+    if [ "$mode" = relay ]; then link=$(relay_link); else link="${pub:-http://${ip:-$host}:$port/}#t=$token"; fi
+    if [ "$1" = "--url" ]; then echo "$link"; return; fi
+    open "$link" || die "couldn't open a browser — the link is: $link"
+    [ "$mode" = relay ] && echo "Opened the remote page. Sign in there (or create an account) to save this Mac to it."
     return
   fi
 
@@ -614,7 +651,14 @@ cmd_remote() {
     || echo "Note: the remote server (lidwaked) isn't running — re-run install.sh."
 }
 
+# Something piped in and no subcommand (or just options): the pipe is the event.
+if [ ! -t 0 ] && { [ $# -eq 0 ] || { [[ $1 == -* ]] && [[ $1 != -h && $1 != --help ]]; }; }; then
+  cmd_pipe "$@"
+  exit
+fi
+
 case "${1:-help}" in
+  pipe)        shift; cmd_pipe "$@" ;;
   start)       shift; cmd_start "$@" ;;
   add)         shift; cmd_add "$@" ;;
   remove|rm)   cmd_remove "${2:-}" ;;

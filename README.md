@@ -12,7 +12,7 @@ What gets installed:
 |---|---|
 | `lidwake` | The engine and CLI (bash). The session re-reads its event list every 5 s, so you can add or remove events while it runs. |
 | `lidwaked` | Remote control server (Swift, LaunchAgent). Serves the web page and a token-protected API, connects to the relay or tunnel, and ends the session if the Mac gets critically hot. |
-| `relay/` | Optional end-to-end encrypted relay (Node, no dependencies) for a permanent link. Deploy it to Render. |
+| `relay/` | End-to-end encrypted relay (Node) for a permanent link, plus optional accounts (Postgres). Deploy it to Render. |
 | `LidWake.app` | Menu bar app: start, add or remove events, and a QR code for your phone. |
 | `com.lidwake.recover` | Runs at login. Turns sleep back on if a session ever crashed. |
 
@@ -41,6 +41,15 @@ lidwake stop                                    # end now, just allow sleep
 
 Events: `--claude`, `--pid`, `--process`, `--for`, `--at`, `--file`, `--cmd`, `--signal`, `--unplug`, `--battery N`.
 
+### Pipe any command into it
+
+```bash
+make build | lidwake                         # awake until the build finishes
+./train.sh 2>&1 | lidwake --then shutdown    # include stderr, then shut down
+rsync -a src/ dst/ | lidwake --battery 20    # any start options work
+```
+The event is the piped command finishing (its output closing). The output still shows in your terminal. If a session is already running, the pipe is added to it as one more event. Ctrl-C stops the session, or, if the session was already running before the pipe, just removes the pipe's event.
+
 Safety limits that are added automatically (you can remove them):
 - **battery ≤ 10%**
 - a **12h limit**, unless you set `--for` or `--at`
@@ -61,6 +70,19 @@ How the Mac is reachable from the internet (switch any time with `lidwake remote
 | `tailscale` | Install [Tailscale](https://tailscale.com/download/mac) on the Mac and sign in. The device you open the page from needs nothing. | `https://<mac>.<tailnet>.ts.net`, **permanent**, so you can bookmark it. The first time, Tailscale may print a link to approve Funnel. |
 | `off` | | Local network only: `http://<mac-ip>:7878` |
 
+### Accounts (optional)
+
+On the relay page you can **create an account** (an email and a password; nothing is ever emailed). Each Mac you open while signed in is saved to it. After that, signing in on any phone, laptop or work PC takes you straight to your Mac, with no link to copy. If you have several Macs, a picker appears at the top.
+
+The installer opens the page on the Mac at the end. Sign in there and that Mac is added. Later, `lidwake remote --open` does the same.
+
+Accounts keep the end-to-end encryption:
+- Your password never leaves the browser. It's stretched with PBKDF2-SHA256 (600,000 rounds) and split into two keys. The **auth key** is sent to sign you in, and the relay stores only a scrypt hash of it. The **vault key** never leaves the browser and encrypts each saved Mac's link.
+- So the database holds only hashes and ciphertext. Neither the server nor anyone who steals the database can reach your Macs without cracking your password.
+- That also means **a forgotten password can't be reset**. Make a new account and open each Mac's link again; the Macs themselves keep working.
+- Wrong passwords are rate-limited (10 per IP and 20 per account per 15 minutes). Sessions last 90 days. **Account → Delete account** removes everything.
+- Links still work without an account.
+
 From the page you can:
 - see the battery level and time left
 - add events (Claude, timer, clock time, process, PID, file, charger, battery, safety limit, signal)
@@ -75,7 +97,9 @@ The installer uses the hosted relay by default. Because of the encryption, that 
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/aaryanbindage/Lidwake)
 
-1. Click the button, or in Render go to **New → Blueprint** and pick this repo. It uses `render.yaml`: a free Node web service called `lidwake-relay`, with no dependencies and no database.
+1. Click the button, or in Render go to **New → Blueprint** and pick this repo. It uses `render.yaml`: a free Node web service called `lidwake-relay` and a free Postgres database `lidwake-db` for accounts, which is reachable only from the service.
+   - Render's free Postgres **expires 30 days after it's created**. Upgrade it to a paid plan in the Render dashboard to keep accounts, or set `DATABASE_URL` to any other Postgres (Neon, Supabase, …).
+   - Without a database, the relay still works; the page just doesn't offer accounts. Self-hosting with a persistent disk can use `ACCOUNTS_FILE=/path/accounts.json` instead of Postgres.
 2. Copy the service URL Render gives you, e.g. `https://lidwake-relay.onrender.com`.
 3. On each Mac, run `lidwake remote --public relay https://lidwake-relay.onrender.com`. Or install with `RELAY_URL=… bash install.sh`.
 4. To make your relay the default for everyone who installs from your copy of the repo, put its URL in `DEFAULT_RELAY_URL` near the top of `lidwake`.
@@ -86,7 +110,7 @@ How the relay is secured:
 - **Mac connects out.** The Mac makes an outgoing, long-polling HTTPS connection to the relay, so it never accepts inbound connections. It proves which device it is with a 256-bit secret; its device ID is derived from that secret.
 - **End-to-end encryption.** Every request and reply is encrypted with **AES-256-GCM**. The key exists only on the Mac and in the link after `#`, and browsers never send that part to any server. The relay only sees device IDs and ciphertext, so it can't read, forge, or change commands. A hijacked or malicious relay could at worst drop messages.
 - **No replays.** Requests carry a timestamp and a single-use nonce, and replies echo the nonce. A captured request can't be replayed, and a reply can't be swapped onto a different request.
-- **Nothing stored.** The relay writes nothing to disk and logs no traffic.
+- **Nothing readable stored.** The relay logs no traffic. Its database holds only account data, as hashes and ciphertext (see Accounts above).
 - **Free tier note.** Render's free tier sleeps when idle. A Mac's long-poll keeps it awake while LidWake is running; if it does fall asleep, the first request takes about a minute to wake it.
 - **Leaked link.** Run `lidwake remote --new-token`. That rotates the key, and old links stop working.
 
