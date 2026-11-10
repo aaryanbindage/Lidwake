@@ -7,7 +7,7 @@
 #   PUBLIC=cloudflare bash install.sh quick tunnel (no account; address changes on restart)
 #   PUBLIC=off bash install.sh        web page on the local network only
 #   REMOTE=0 bash install.sh          skips the remote control server
-# Default: the relay if RELAY_URL (or DEFAULT_RELAY_URL in ./lidwake) is set, else Cloudflare.
+# Default: the relay (RELAY_URL, else DEFAULT_RELAY_URL in ./lidwake, the hosted one); Cloudflare if neither is set.
 set -euo pipefail
 cd "$(dirname "$0")"
 

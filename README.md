@@ -56,8 +56,8 @@ How the Mac is reachable from the internet (switch any time with `lidwake remote
 
 | Mode | Setup | Address |
 |---|---|---|
-| `relay` (recommended) | Deploy the relay to Render once (below). After that, users need nothing. | `https://<your-relay>.onrender.com/#d=…&k=…`: **permanent** and **end-to-end encrypted**. |
-| `cloudflare` (default if no relay is set) | None; the installer adds `cloudflared` | `https://<random>.trycloudflare.com`. It **changes when the Mac restarts**: run `lidwake remote` again, or set up `NTFY_URL` (below) to get the new address as a push notification. |
+| `relay` (default) | None. The installer uses the hosted relay at `https://lidwake-relay.onrender.com`; to run your own, see below. | `https://lidwake-relay.onrender.com/#d=…&k=…`: **permanent** and **end-to-end encrypted**. |
+| `cloudflare` | None; the installer adds `cloudflared` | `https://<random>.trycloudflare.com`. It **changes when the Mac restarts**: run `lidwake remote` again, or set up `NTFY_URL` (below) to get the new address as a push notification. |
 | `tailscale` | Install [Tailscale](https://tailscale.com/download/mac) on the Mac and sign in. The device you open the page from needs nothing. | `https://<mac>.<tailnet>.ts.net`, **permanent**, so you can bookmark it. The first time, Tailscale may print a link to approve Funnel. |
 | `off` | | Local network only: `http://<mac-ip>:7878` |
 
@@ -69,14 +69,16 @@ From the page you can:
 - **Stop** or **End now**
 - start a new session when none is running
 
-### Deploy the relay to Render
+### Run your own relay (optional)
+
+The installer uses the hosted relay by default. Because of the encryption, that relay can't read or change your commands, so running your own isn't needed for security. Do it if you want to stay independent of the hosted one.
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/aaryanbindage/Lidwake)
 
 1. Click the button, or in Render go to **New → Blueprint** and pick this repo. It uses `render.yaml`: a free Node web service called `lidwake-relay`, with no dependencies and no database.
 2. Copy the service URL Render gives you, e.g. `https://lidwake-relay.onrender.com`.
 3. On each Mac, run `lidwake remote --public relay https://lidwake-relay.onrender.com`. Or install with `RELAY_URL=… bash install.sh`.
-4. To make the relay the default for everyone who installs from this repo, put the URL in `DEFAULT_RELAY_URL` near the top of `lidwake`.
+4. To make your relay the default for everyone who installs from your copy of the repo, put its URL in `DEFAULT_RELAY_URL` near the top of `lidwake`.
 
 One relay serves any number of Macs. Each Mac gets its own random device ID and key.
 

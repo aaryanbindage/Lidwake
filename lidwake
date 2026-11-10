@@ -28,7 +28,7 @@ RELAY_SECRET_FILE="$STATE_DIR/relay.secret"   # proves this Mac's identity to th
 RELAY_KEY_FILE="$STATE_DIR/relay.key"         # end-to-end encryption key (never sent to the relay)
 # Relay used when none is given — set this to your Render URL so users get a
 # permanent link with no setup, e.g. https://lidwake-relay.onrender.com
-DEFAULT_RELAY_URL=""
+DEFAULT_RELAY_URL="https://lidwake-relay.onrender.com"
 PUBLIC_URL_FILE="$STATE_DIR/public.url"     # internet address of the web UI, if enabled
 PMSET=/usr/bin/pmset
 POLL=5
