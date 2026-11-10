@@ -95,11 +95,11 @@
   <div id="banner" class="banner err" hidden></div>
 
   <section id="auth" class="card" hidden>
-    <p class="big">Enter access token</p>
-    <p class="muted">Run <code>lidwake remote</code> on the Mac and open the link it prints, or paste the token (the part after <code>#t=</code>) here.</p>
+    <p class="big">Connect to your Mac</p>
+    <p class="muted">Run <code>lidwake remote</code> on the Mac and open the link it prints, or paste that link here.</p>
     <form id="tokenForm" class="add" style="border:0;padding:0">
       <div class="row">
-        <input id="tokenInput" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="token">
+        <input id="tokenInput" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="link or token">
         <button class="primary">Save</button>
       </div>
     </form>
@@ -155,12 +155,32 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, v); } catch {} },
 };
 
-let token = store.get('lidwake-token') || '';
-const fromHash = location.hash.match(/t=([0-9a-f]+)/);
+// Two ways to reach the Mac:
+//  direct — this page is served by the Mac (LAN or tunnel); calls /api with a bearer token. Link: #t=TOKEN
+//  relay  — this page is served by a LidWake relay; every call is AES-256-GCM encrypted with a
+//           key that only the Mac and this link's #fragment know.               Link: #d=DEVICE&k=KEY
+let creds = null;
+try { creds = JSON.parse(store.get('lidwake-creds')); } catch {}
+if (!creds && store.get('lidwake-token')) creds = { mode: 'direct', token: store.get('lidwake-token') };
+
+function credsFromFragment(fragment) {
+  const p = new URLSearchParams(fragment.replace(/^.*#/, ''));
+  if (/^[0-9a-f]{32}$/.test(p.get('d') || '') && /^[A-Za-z0-9_-]{43}$/.test(p.get('k') || '')) {
+    return { mode: 'relay', d: p.get('d'), k: p.get('k') };
+  }
+  if (/^[0-9a-f]+$/.test(p.get('t') || '')) return { mode: 'direct', token: p.get('t') };
+  return null;
+}
+function saveCreds(c) {
+  creds = c;
+  keyPromise = null;
+  store.set('lidwake-creds', JSON.stringify(c));
+}
+let keyPromise = null;
+const fromHash = credsFromFragment(location.hash);
 if (fromHash) {
-  token = fromHash[1];
-  store.set('lidwake-token', token);
-  history.replaceState(null, '', location.pathname);
+  saveCreds(fromHash);
+  history.replaceState(null, '', location.pathname);   // keep the key out of the address bar
 }
 
 let state = null;          // last /api/status
@@ -191,16 +211,64 @@ function argsFor(type, value) {
   }
 }
 
+class OfflineError extends Error {}
+
 async function api(path, body) {
+  if (!creds) { showAuth(); throw new Error('Wrong or missing access token'); }
+  if (creds.mode === 'relay') return relayCall(path, body);
   const res = await fetch('/api/' + path, {
     method: body === undefined ? 'GET' : 'POST',
-    headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+    headers: { Authorization: 'Bearer ' + creds.token, 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (res.status === 401) { showAuth(); throw new Error('Wrong or missing access token'); }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || 'Request failed (' + res.status + ')');
   return data;
+}
+
+// --- end-to-end encryption for relay mode ---
+const toB64 = (bytes) => btoa(String.fromCharCode(...bytes));
+const fromB64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+const fromB64url = (s) => fromB64(s.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - s.length % 4) % 4));
+
+function relayKey() {
+  if (!window.crypto || !crypto.subtle) throw new Error('This browser can’t encrypt on this page (it needs HTTPS).');
+  return keyPromise ||= crypto.subtle.importKey('raw', fromB64url(creds.k), 'AES-GCM', false, ['encrypt', 'decrypt']);
+}
+
+// Wire format: base64(iv[12] | ciphertext | tag[16]) — matches CryptoKit's AES.GCM "combined".
+async function seal(obj) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, await relayKey(),
+    new TextEncoder().encode(JSON.stringify(obj))));
+  const out = new Uint8Array(iv.length + ct.length);
+  out.set(iv);
+  out.set(ct, iv.length);
+  return toB64(out);
+}
+
+async function unseal(text) {
+  const data = fromB64(text);
+  const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: data.slice(0, 12) }, await relayKey(), data.slice(12));
+  return JSON.parse(new TextDecoder().decode(plain));
+}
+
+async function relayCall(path, body) {
+  const nonce = toB64(crypto.getRandomValues(new Uint8Array(16)));
+  const data = await seal({ nonce, ts: Date.now(), method: body === undefined ? 'GET' : 'POST',
+    path: '/api/' + path, body: body || {} });
+  const res = await fetch('/api/' + creds.d, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ data }),
+  });
+  const out = await res.json().catch(() => ({}));
+  if (res.status === 503 || res.status === 504) throw new OfflineError(out.error || 'The Mac is offline or asleep.');
+  if (!res.ok) throw new Error(out.error || 'Request failed (' + res.status + ')');
+  let reply;
+  try { reply = await unseal(out.data); } catch { throw new Error('Couldn’t decrypt the Mac’s reply — this link may be out of date.'); }
+  if (reply.nonce !== nonce) throw new Error('The reply didn’t match the request — try again.');
+  if (reply.status >= 400) throw new Error((reply.body && reply.body.error) || 'Request failed');
+  return reply.body;
 }
 
 async function act(path, body) {
@@ -221,12 +289,14 @@ async function act(path, body) {
 }
 
 async function refresh() {
-  if (!token) return showAuth();
+  if (!creds) return showAuth();
   try {
     apply(await api('status'));
-    if ($('banner').dataset.kind === 'offline') hideBanner();
+    if ($('banner').dataset.kind) hideBanner();
   } catch (e) {
-    if (e instanceof TypeError) showBanner('Can’t reach the Mac — it may be asleep, offline, or its tunnel address changed (run lidwake remote on the Mac).', 'offline');
+    if (e instanceof OfflineError) showBanner(e.message + ' It reconnects automatically when the Mac wakes.', 'offline');
+    else if (e instanceof TypeError) showBanner('Can’t reach the Mac — it may be asleep, offline, or its address changed (run lidwake remote on the Mac).', 'offline');
+    else if (e.message !== 'Wrong or missing access token') showBanner(e.message, 'error');
   }
 }
 
@@ -390,8 +460,11 @@ $('endBtn').addEventListener('click', () => {
 });
 $('tokenForm').addEventListener('submit', (e) => {
   e.preventDefault();
-  token = $('tokenInput').value.trim();
-  store.set('lidwake-token', token);
+  const value = $('tokenInput').value.trim();
+  const parsed = value.includes('#') ? credsFromFragment(value) : /^[0-9a-f]+$/.test(value) ? { mode: 'direct', token: value } : null;
+  if (!parsed) return showBanner('That doesn’t look like a LidWake link or token.');
+  saveCreds(parsed);
+  hideBanner();
   refresh();
 });
 

@@ -11,7 +11,8 @@ What gets installed:
 | Part | What it is |
 |---|---|
 | `lidwake` | The engine and CLI (bash). The session re-reads its event list every 5 s, so you can add or remove events while it runs. |
-| `lidwaked` | Remote control server (Swift, LaunchAgent). Serves the web page and a token-protected API, and ends the session if the Mac gets critically hot. |
+| `lidwaked` | Remote control server (Swift, LaunchAgent). Serves the web page and a token-protected API, connects to the relay or tunnel, and ends the session if the Mac gets critically hot. |
+| `relay/` | Optional end-to-end encrypted relay (Node, no dependencies) for a permanent link. Deploy it to Render. |
 | `LidWake.app` | Menu bar app: start, add or remove events, and a QR code for your phone. |
 | `com.lidwake.recover` | Runs at login. Turns sleep back on if a session ever crashed. |
 
@@ -55,7 +56,8 @@ How the Mac is reachable from the internet (switch any time with `lidwake remote
 
 | Mode | Setup | Address |
 |---|---|---|
-| `cloudflare` (default) | None; the installer adds `cloudflared` | `https://<random>.trycloudflare.com`. It **changes when the Mac restarts**: run `lidwake remote` again, or set up `NTFY_URL` (below) to get the new address as a push notification. |
+| `relay` (recommended) | Deploy the relay to Render once (below). After that, users need nothing. | `https://<your-relay>.onrender.com/#d=…&k=…`: **permanent** and **end-to-end encrypted**. |
+| `cloudflare` (default if no relay is set) | None; the installer adds `cloudflared` | `https://<random>.trycloudflare.com`. It **changes when the Mac restarts**: run `lidwake remote` again, or set up `NTFY_URL` (below) to get the new address as a push notification. |
 | `tailscale` | Install [Tailscale](https://tailscale.com/download/mac) on the Mac and sign in. The device you open the page from needs nothing. | `https://<mac>.<tailnet>.ts.net`, **permanent**, so you can bookmark it. The first time, Tailscale may print a link to approve Funnel. |
 | `off` | | Local network only: `http://<mac-ip>:7878` |
 
@@ -67,7 +69,26 @@ From the page you can:
 - **Stop** or **End now**
 - start a new session when none is running
 
-Security:
+### Deploy the relay to Render
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/aaryanbindage/Lidwake)
+
+1. Click the button, or in Render go to **New → Blueprint** and pick this repo. It uses `render.yaml`: a free Node web service called `lidwake-relay`, with no dependencies and no database.
+2. Copy the service URL Render gives you, e.g. `https://lidwake-relay.onrender.com`.
+3. On each Mac, run `lidwake remote --public relay https://lidwake-relay.onrender.com`. Or install with `RELAY_URL=… bash install.sh`.
+4. To make the relay the default for everyone who installs from this repo, put the URL in `DEFAULT_RELAY_URL` near the top of `lidwake`.
+
+One relay serves any number of Macs. Each Mac gets its own random device ID and key.
+
+How the relay is secured:
+- **Mac connects out.** The Mac makes an outgoing, long-polling HTTPS connection to the relay, so it never accepts inbound connections. It proves which device it is with a 256-bit secret; its device ID is derived from that secret.
+- **End-to-end encryption.** Every request and reply is encrypted with **AES-256-GCM**. The key exists only on the Mac and in the link after `#`, and browsers never send that part to any server. The relay only sees device IDs and ciphertext, so it can't read, forge, or change commands. A hijacked or malicious relay could at worst drop messages.
+- **No replays.** Requests carry a timestamp and a single-use nonce, and replies echo the nonce. A captured request can't be replayed, and a reply can't be swapped onto a different request.
+- **Nothing stored.** The relay writes nothing to disk and logs no traffic.
+- **Free tier note.** Render's free tier sleeps when idle. A Mac's long-poll keeps it awake while LidWake is running; if it does fall asleep, the first request takes about a minute to wake it.
+- **Leaked link.** Run `lidwake remote --new-token`. That rotates the key, and old links stop working.
+
+Security (direct and tunnel modes):
 - Every API call needs the 128-bit token in the link. If a link leaks, run `lidwake remote --new-token`.
 - After 20 wrong tokens in a minute, the API is locked for a minute.
 - The token sits after `#` in the link, so browsers never send it in requests or logs. The page keeps it in that browser's storage.

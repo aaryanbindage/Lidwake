@@ -24,6 +24,11 @@ LOCK_DIR="$STATE_DIR/start.lock"
 LOG_FILE="$STATE_DIR/lidwake.log"
 CONFIG_FILE="$STATE_DIR/config"        # KEY=value lines: NTFY_URL, REMOTE_PORT, PUBLIC
 TOKEN_FILE="$STATE_DIR/remote.token"
+RELAY_SECRET_FILE="$STATE_DIR/relay.secret"   # proves this Mac's identity to the relay
+RELAY_KEY_FILE="$STATE_DIR/relay.key"         # end-to-end encryption key (never sent to the relay)
+# Relay used when none is given — set this to your Render URL so users get a
+# permanent link with no setup, e.g. https://lidwake-relay.onrender.com
+DEFAULT_RELAY_URL=""
 PUBLIC_URL_FILE="$STATE_DIR/public.url"     # internet address of the web UI, if enabled
 PMSET=/usr/bin/pmset
 POLL=5
@@ -65,7 +70,7 @@ Other:
   lidwake signal NAME            fire a signal (used by the Claude hook)
   lidwake claude-hook [--install]  show / install the Claude Code Stop hook
   lidwake remote [--url|--new-token]  remote control web address
-  lidwake remote --public cloudflare|tailscale|off   reach it from anywhere
+  lidwake remote --public relay URL|cloudflare|tailscale|off   reach it from anywhere
   lidwake recover                re-enable sleep if a session died
 
 Examples:
@@ -79,7 +84,7 @@ log() {
   local line
   line="$(date '+%Y-%m-%d %H:%M:%S') $*"
   echo "$line" >>"$LOG_FILE"
-  [ -t 2 ] && echo "$line" >&2
+  if [ -t 2 ]; then echo "$line" >&2; fi
 }
 
 die() { echo "lidwake: $*" >&2; exit 1; }
@@ -499,6 +504,21 @@ ensure_token() {
     od -An -tx1 -N16 /dev/urandom | tr -d ' \n' >"$TOKEN_FILE"
     chmod 600 "$TOKEN_FILE"
   fi
+  if [ ! -s "$RELAY_SECRET_FILE" ]; then
+    od -An -tx1 -N32 /dev/urandom | tr -d ' \n' >"$RELAY_SECRET_FILE"
+    chmod 600 "$RELAY_SECRET_FILE"
+  fi
+  if [ ! -s "$RELAY_KEY_FILE" ] || [ "$1" = new ]; then
+    head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n' >"$RELAY_KEY_FILE"
+    chmod 600 "$RELAY_KEY_FILE"
+  fi
+}
+
+relay_device_id() { printf %s "$(cat "$RELAY_SECRET_FILE")" | shasum -a 256 | cut -c1-32; }
+
+relay_link() {
+  local url; url=$(config_get RELAY_URL)
+  echo "${url%/}/#d=$(relay_device_id)&k=$(cat "$RELAY_KEY_FILE")"
 }
 
 config_set() {
@@ -518,9 +538,16 @@ remote_port() { local p; p=$(config_get REMOTE_PORT); echo "${p:-7878}"; }
 
 # Public (internet) access: lidwaked runs a Cloudflare quick tunnel itself and
 # writes its URL to PUBLIC_URL_FILE; Tailscale Funnel is set up once here.
-set_public() {
+set_public() {  # set_public MODE [RELAY_URL]
   local ts url
   case $1 in
+    relay)
+      url=${2:-$(config_get RELAY_URL)}; url=${url:-$DEFAULT_RELAY_URL}; url=${url%/}
+      [[ $url =~ ^https://[^/#?]+$ ]] || die "usage: lidwake remote --public relay https://your-relay.onrender.com"
+      echo "Checking $url (a sleeping Render free instance can take a minute to wake)…"
+      curl -fsS -m 90 "$url/healthz" >/dev/null || die "no LidWake relay answering at $url"
+      config_set RELAY_URL "$url"
+      ;;
     cloudflare)
       cloudflared_bin >/dev/null || die "cloudflared isn't installed — run: brew install cloudflared (or re-run install.sh)" ;;
     tailscale)
@@ -531,7 +558,7 @@ set_public() {
       [ -n "$url" ] || die "couldn't read this Mac's Tailscale name"
       ;;
     off) ;;
-    *) die "usage: lidwake remote --public cloudflare|tailscale|off" ;;
+    *) die "usage: lidwake remote --public relay URL|cloudflare|tailscale|off" ;;
   esac
   if [ "$(config_get PUBLIC)" = tailscale ] && [ "$1" != tailscale ]; then
     ts=$(tailscale_bin) && "$ts" funnel reset >/dev/null 2>&1
@@ -550,8 +577,9 @@ set_public() {
 cmd_remote() {
   local token port ip host pub mode
   case $1 in
-    --new-token) ensure_token new; echo "New token created; old links stop working." ;;
-    --public)    set_public "$2" ;;
+    --new-token) ensure_token new; launchctl kickstart -k "gui/$(id -u)/com.lidwake.remote" >/dev/null 2>&1
+                 echo "New token and encryption key created; old links stop working." ;;
+    --public)    set_public "$2" "$3" ;;
   esac
   ensure_token
   token=$(cat "$TOKEN_FILE")
@@ -561,14 +589,21 @@ cmd_remote() {
   pub=$(cat "$PUBLIC_URL_FILE" 2>/dev/null)
   mode=$(config_get PUBLIC); mode=${mode:-off}
 
-  if [ "$1" = "--url" ]; then echo "${pub:-http://${ip:-$host}:$port/}#t=$token"; return; fi
+  if [ "$1" = "--url" ]; then
+    if [ "$mode" = relay ]; then relay_link; else echo "${pub:-http://${ip:-$host}:$port/}#t=$token"; fi
+    return
+  fi
 
   echo "From any device, anywhere:"
-  if [ -n "$pub" ]; then
+  if [ "$mode" = relay ]; then
+    echo "  $(relay_link)"
+    echo "  (permanent link, end-to-end encrypted — the relay can't read or send commands)"
+  elif [ -n "$pub" ]; then
     echo "  $pub#t=$token"
     [ "$mode" = cloudflare ] && echo "  (Cloudflare quick-tunnel address — it changes when the Mac restarts)"
   elif [ "$mode" = off ]; then
-    echo "  off — enable with: lidwake remote --public cloudflare   (or: --public tailscale)"
+    echo "  off — enable with: lidwake remote --public relay https://your-relay.onrender.com"
+    echo "        (or: --public cloudflare, --public tailscale)"
   else
     echo "  tunnel is starting or failing — see ~/Library/Application Support/LidWake/com.lidwake.remote.log"
   fi

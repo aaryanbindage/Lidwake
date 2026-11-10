@@ -2,10 +2,12 @@
 # Installs the lidwake CLI, its sudoers rule, a login-time safety LaunchAgent,
 # and — if Xcode command line tools are present — the remote control server
 # (lidwaked + web UI) and the LidWake menu bar app.
-#   REMOTE=0 bash install.sh          skips the remote control server
+#   RELAY_URL=https://x.onrender.com bash install.sh   permanent, end-to-end encrypted link via your relay
 #   PUBLIC=tailscale bash install.sh  stable https://<mac>.ts.net address via Tailscale Funnel
+#   PUBLIC=cloudflare bash install.sh quick tunnel (no account; address changes on restart)
 #   PUBLIC=off bash install.sh        web page on the local network only
-# Default: a Cloudflare quick tunnel (no account; address changes on restart).
+#   REMOTE=0 bash install.sh          skips the remote control server
+# Default: the relay if RELAY_URL (or DEFAULT_RELAY_URL in ./lidwake) is set, else Cloudflare.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -90,14 +92,18 @@ else
     "$BIN/lidwake" remote --url >/dev/null   # creates the access token
     load_agent com.lidwake.remote true "$BIN/lidwaked"
 
-    public_mode=${PUBLIC:-cloudflare}
+    relay_url=${RELAY_URL:-$(sed -n 's/^DEFAULT_RELAY_URL="\(.*\)"$/\1/p' lidwake)}
+    if [ -n "${PUBLIC:-}" ]; then public_mode=$PUBLIC
+    elif [ -n "$relay_url" ]; then public_mode=relay
+    else public_mode=cloudflare
+    fi
     if [ "$public_mode" = cloudflare ] && ! install_cloudflared; then
       echo "! couldn't install cloudflared — internet access stays off (LAN still works)"
       public_mode=off
     fi
     echo "→ Internet access: $public_mode"
-    "$BIN/lidwake" remote --public "$public_mode" >/dev/null \
-      || echo "! couldn't enable '$public_mode' — retry later with: lidwake remote --public $public_mode"
+    "$BIN/lidwake" remote --public "$public_mode" ${relay_url:+"$relay_url"} >/dev/null \
+      || echo "! couldn't enable '$public_mode' — retry later with: lidwake remote --public $public_mode $relay_url"
   fi
 
   echo "→ Building menu bar app to $APP"

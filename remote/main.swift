@@ -1,10 +1,12 @@
 // lidwaked — LidWake's remote control server. Serves the web UI and a small JSON
 // API that forwards to the `lidwake` CLI, so any browser can stop a session or
-// add events. With PUBLIC=cloudflare it also runs a Cloudflare quick tunnel so
-// the page is reachable from anywhere over HTTPS (Tailscale Funnel is set up by
-// `lidwake remote --public tailscale` instead). Ends a session if the Mac
-// overheats. Runs as a LaunchAgent; every /api call needs the token from
+// add events. For access from anywhere it either connects out to a LidWake
+// relay (PUBLIC=relay, end-to-end encrypted, permanent link — see relay/) or
+// runs a Cloudflare quick tunnel (PUBLIC=cloudflare); Tailscale Funnel is set
+// up by `lidwake remote --public tailscale` instead. Ends a session if the Mac
+// overheats. Runs as a LaunchAgent; direct /api calls need the token from
 // `lidwake remote`.
+import CryptoKit
 import Foundation
 import Network
 
@@ -187,11 +189,16 @@ func handle(_ request: Request) -> Response {
         recordAuthFailure()
         return .error(401, "missing or wrong token")
     }
-
     let body = (try? JSONSerialization.jsonObject(with: request.body)) as? [String: Any] ?? [:]
+    return route(request.method, request.path, body)
+}
+
+/// The API itself, shared by direct requests (token-checked above) and relay
+/// requests (authenticated by decrypting with the relay key).
+func route(_ method: String, _ path: String, _ body: [String: Any]) -> Response {
     let id = (body["id"] as? Int).map(String.init) ?? ""
 
-    switch (request.method, request.path) {
+    switch (method, path) {
     case ("GET", "/api/status"):
         return status()
     case ("POST", "/api/start"):
@@ -293,7 +300,127 @@ func runTunnel() {
     }
 }
 
-if config("PUBLIC") == "cloudflare" { runTunnel() }
+// MARK: - relay (e.g. on Render)
+
+/// Connects out to a LidWake relay so a browser anywhere can reach this Mac at a
+/// permanent address. The relay only passes along opaque blobs: requests and
+/// replies are sealed with AES-256-GCM using a key that only this Mac and the
+/// link's #fragment hold, so the relay can't read, forge or alter them. Each
+/// request carries a timestamp and a single-use nonce, which the reply echoes.
+final class RelayClient {
+    private let base: URL
+    private let secret: String
+    private let key: SymmetricKey
+    private let session: URLSession
+    private let lock = NSLock()
+    private var seenNonces: [String: Date] = [:]
+    private var failures = 0
+
+    init?(base: String, secret: String, key: String) {
+        var b64 = key.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        b64 += String(repeating: "=", count: (4 - b64.count % 4) % 4)
+        guard let url = URL(string: base), let keyData = Data(base64Encoded: b64), keyData.count == 32,
+              !secret.isEmpty else { return nil }
+        self.base = url
+        self.secret = secret
+        self.key = SymmetricKey(data: keyData)
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 45
+        session = URLSession(configuration: config)
+    }
+
+    func start() {
+        logLine("relay: connecting to \(base.absoluteString)")
+        poll()
+    }
+
+    /// Long-poll: the relay holds the request open until a browser sends something (or ~25s pass).
+    private func poll() {
+        var request = URLRequest(url: base.appendingPathComponent("agent/poll"))
+        request.setValue(secret, forHTTPHeaderField: "X-Agent-Secret")
+        session.dataTask(with: request) { data, response, error in
+            guard (response as? HTTPURLResponse)?.statusCode == 200, let data,
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let requests = object["requests"] as? [[String: Any]]
+            else {
+                // Relay down, cold-starting (Render free tier) or no network: back off up to 30s.
+                self.failures += 1
+                if self.failures == 3 { logLine("relay: unreachable (\(error?.localizedDescription ?? "bad response")), retrying") }
+                let delay = min(30.0, pow(2.0, Double(self.failures)))
+                queue.asyncAfter(deadline: .now() + delay) { self.poll() }
+                return
+            }
+            if self.failures >= 3 { logLine("relay: connected") }
+            self.failures = 0
+            for item in requests { queue.async { self.process(item) } }
+            self.poll()
+        }.resume()
+    }
+
+    private func process(_ item: [String: Any]) {
+        guard let id = item["id"] as? String, let sealed = item["data"] as? String else { return }
+        guard let plain = open(sealed),
+              let message = try? JSONSerialization.jsonObject(with: plain) as? [String: Any],
+              let nonce = message["nonce"] as? String, let sentAt = message["ts"] as? Double,
+              let method = message["method"] as? String, let path = message["path"] as? String
+        else { return reply(["id": id, "error": "undecryptable"]) }
+        guard abs(Date().timeIntervalSince1970 - sentAt / 1000) < 120, isFresh(nonce) else {
+            return reply(["id": id, "error": "stale"])
+        }
+        let response = route(method, path, message["body"] as? [String: Any] ?? [:])
+        let body = (try? JSONSerialization.jsonObject(with: response.body)) ?? ["error": "bad response"]
+        let answer: [String: Any] = ["nonce": nonce, "status": response.status, "body": body]
+        guard let answerData = try? JSONSerialization.data(withJSONObject: answer),
+              let sealedAnswer = seal(answerData) else { return }
+        reply(["id": id, "data": sealedAnswer])
+    }
+
+    private func reply(_ payload: [String: Any]) {
+        var request = URLRequest(url: base.appendingPathComponent("agent/reply"))
+        request.httpMethod = "POST"
+        request.setValue(secret, forHTTPHeaderField: "X-Agent-Secret")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+        session.dataTask(with: request).resume()
+    }
+
+    /// Rejects a nonce seen in the last 5 minutes, so a captured request can't be replayed.
+    private func isFresh(_ nonce: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let cutoff = Date().addingTimeInterval(-300)
+        seenNonces = seenNonces.filter { $0.value > cutoff }
+        guard seenNonces[nonce] == nil else { return false }
+        seenNonces[nonce] = Date()
+        return true
+    }
+
+    // Wire format: base64(nonce[12] | ciphertext | tag[16]) — what WebCrypto produces with the IV prepended.
+    private func seal(_ data: Data) -> String? {
+        (try? AES.GCM.seal(data, using: key))?.combined?.base64EncodedString()
+    }
+
+    private func open(_ text: String) -> Data? {
+        guard let data = Data(base64Encoded: text), let box = try? AES.GCM.SealedBox(combined: data) else { return nil }
+        return try? AES.GCM.open(box, using: key)
+    }
+}
+
+var relay: RelayClient?
+
+func readState(_ name: String) -> String {
+    (try? String(contentsOf: stateDir.appendingPathComponent(name), encoding: .utf8))?
+        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+}
+
+switch config("PUBLIC") {
+case "cloudflare":
+    runTunnel()
+case "relay":
+    relay = RelayClient(base: config("RELAY_URL") ?? "", secret: readState("relay.secret"), key: readState("relay.key"))
+    if let relay { relay.start() } else { logLine("relay: missing RELAY_URL or keys — run: lidwake remote --public relay URL") }
+default:
+    break
+}
 
 // Thermal guard: a closed laptop can't vent through the keyboard, so end the session if it gets critical.
 let thermalTimer = DispatchSource.makeTimerSource(queue: queue)

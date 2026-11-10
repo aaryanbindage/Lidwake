@@ -1,0 +1,11 @@
+# Render Blueprint for the LidWake relay (relay/server.js — no dependencies).
+# Render dashboard → New → Blueprint → pick this repo, or use the button in README.md.
+services:
+  - type: web
+    name: lidwake-relay
+    runtime: node
+    plan: free
+    buildCommand: npm install --omit=dev
+    startCommand: npm start
+    healthCheckPath: /healthz
+    autoDeploy: true
